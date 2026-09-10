@@ -21,13 +21,26 @@ docs/               Team work distribution, architecture decision records
 src/foresight/
   models/           Core world model: GAT encoder, entity GRU, global LSTM,
                     transition prior, rollout, heads, decoders, survival transforms
+  training/         Section-15 objectives (censored survival NLL, Gaussian
+                    observable NLL, edge/tactic BCE), D.6 target contract,
+                    AdamW trainer with rollout curriculum and split guard
+  calibration/      I.4 affine hazard calibrators (horizon-group intercepts),
+                    pooled/abstain backoff, CalibratorSet interface
+  runtime/          Section-26 inference core: observe -> rollout -> calibrate
+                    -> survival -> conditional ETA; I.5 ensemble mixtures
 tests/              Contract/unit tests (Appendix R catalogue IDs in docstrings)
 ```
 
 Module areas owned by other teammates (ingest/, identity/, features/, graphs/,
-labels/, data/, training/, calibration/, sentinel/, evaluation/, explain/,
-runtime/, storage/, api/, apps/console/) are added as they are implemented; see
-the work distribution PDF and Build Spec Appendix C.2 for the target layout.
+labels/, data/, sentinel/, evaluation/, explain/, storage/, api/,
+apps/console/) are added as they are implemented; see the work distribution PDF
+and Build Spec Appendix C.2 for the target layout. The world-model area
+(models, training, calibration, runtime forecast core) is complete and tested
+against synthetic fixtures — the team PDF's "synthetic vertical slice through
+real interfaces" done-criterion passes end to end (tests/unit/test_forecast_engine.py).
+No trained weights yet: real-data training and calibration waits on the
+labels/data modules; the trainer, loss functions and calibrators are ready to
+consume their outputs.
 
 ## Environment
 
@@ -45,7 +58,9 @@ python -m pytest
 
 Test IDs reference the automated test catalogue in Build Spec Appendix R.3
 (MO01-MO05 model contracts, GR01-GR02 graph batching, ID02 identity
-equivariance, CA01-CA03 calibration math, golden examples 1 and 3).
+equivariance, CA01-CA03 calibration math, TR01 censored-likelihood hand
+calculation, TR02 test-split guard, TR03 logging policy, golden examples 1
+and 3, and the Section-26 vertical slice).
 
 ## Implementation decision records
 

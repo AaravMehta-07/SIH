@@ -157,6 +157,81 @@ def build_candidates(
     )
 
 
+def build_targets(
+    *,
+    num_nodes: int = 4,
+    horizon_bins: int = 60,
+    num_tasks: int = 5,
+    candidates: CandidatePairs | None = None,
+    event_specs: dict[tuple[int, int], int] | None = None,
+    censor_bins: int | None = None,
+    task_mask: torch.Tensor | None = None,
+    node_valid: torch.Tensor | None = None,
+    global_valid: torch.Tensor | None = None,
+    edge_mask: torch.Tensor | None = None,
+    split: str = "train",
+    seed: int = 0,
+):
+    """Deterministic synthetic ClipTargets (Appendix D.6).
+
+    ``event_specs[(n, t)] = k >= 1`` places the first observed event of task t
+    for entity n in bin k (risk bins stop at k). ``= 0`` marks a censored row
+    with follow-up of ``censor_bins`` (default: full horizon). Unlisted rows
+    are censored with full follow-up.
+    """
+    from foresight.training.targets import ClipTargets
+
+    gen = torch.Generator().manual_seed(seed)
+    N, H, J = num_nodes, horizon_bins, num_tasks
+    if candidates is None:
+        candidates = build_candidates()
+    if censor_bins is None:
+        censor_bins = H
+
+    event_y = torch.zeros(N, H, J)
+    risk_mask = torch.ones(N, H, J, dtype=torch.bool)
+    for (n, t), k in (event_specs or {}).items():
+        if k >= 1:
+            event_y[n, k - 1, t] = 1.0
+            risk_mask[n, :, t] = False
+            risk_mask[n, :k, t] = True
+        else:
+            risk_mask[n, :, t] = False
+            risk_mask[n, :censor_bins, t] = True
+
+    stage_labels = (torch.rand(N, H, 5, generator=gen) < 0.2).float()
+    stage_mask = torch.ones(N, H, 5, dtype=torch.bool)
+    node_values = torch.randn(N, H, NODE_VALUES, generator=gen)
+    if node_valid is None:
+        node_valid = torch.rand(N, H, NODE_VALUES, generator=gen) < 0.95
+    global_values = torch.randn(H, GLOBAL_VALUES, generator=gen)
+    if global_valid is None:
+        global_valid = torch.rand(H, GLOBAL_VALUES, generator=gen) < 0.95
+    E = int(candidates.batch_index.shape[0])
+    edge_labels = (torch.rand(E, H, generator=gen) < 0.3).float()
+    if edge_mask is None:
+        edge_mask = torch.rand(E, H, generator=gen) < 0.9
+    if task_mask is None:
+        task_mask = torch.ones(J, dtype=torch.bool)
+
+    return ClipTargets(
+        event_y=event_y,
+        risk_mask=risk_mask,
+        stage_labels=stage_labels,
+        stage_mask=stage_mask,
+        node_values=node_values,
+        node_valid=node_valid,
+        global_values=global_values,
+        global_valid=global_valid,
+        edge_labels=edge_labels,
+        edge_mask=edge_mask,
+        candidate_pairs=candidates,
+        task_mask=task_mask,
+        split=split,
+        num_event_tasks=num_tasks,
+    )
+
+
 def observed_state(model: ForesightWorldModel, clip: list[GraphWindowBatch]):
     state = model.zero_state(clip[0].node_present)
     for window in clip:
