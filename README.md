@@ -9,59 +9,99 @@ The authoritative engineering contract is [`FORESIGHT_Build_Spec.md`](FORESIGHT_
 [`FORESIGHT_Final_Architecture.pdf`](FORESIGHT_Final_Architecture.pdf). Team work
 distribution: [`docs/FORESIGHT_Team_Work_Distribution.pdf`](docs/FORESIGHT_Team_Work_Distribution.pdf).
 
-**Status: Tier A build in progress.** No trained weights, measured performance or
-completed software are claimed. Accuracy claims require the evaluation gates in
-Build Spec Section 29.
+**Status: Tier A build in progress.** The pipeline runs end-to-end on disclosed
+synthetic captures. No real-network measured performance is claimed; accuracy
+claims require the evaluation gates in Build Spec Section 29.
 
 ## Repository layout
 
 ```
 configs/            Frozen configuration (Section 35 is the only default profile)
-docs/               Team work distribution, architecture decision records
+scripts/            Reproducible entry points (train_profile, evaluate_profile, serve_console)
 src/foresight/
-  models/           Core world model: GAT encoder, entity GRU, global LSTM,
-                    transition prior, rollout, heads, decoders, survival transforms
-  training/         Section-15 objectives (censored survival NLL, Gaussian
-                    observable NLL, edge/tactic BCE), D.6 target contract,
-                    AdamW trainer with rollout curriculum and split guard
-  calibration/      I.4 affine hazard calibrators (horizon-group intercepts),
-                    pooled/abstain backoff, CalibratorSet interface
-  runtime/          Section-26 inference core: observe -> rollout -> calibrate
-                    -> survival -> conditional ETA; I.5 ensemble mixtures
+  contracts/        Typed records, canonical JSON, capability/quality reports (D)
+  ingest/           Flow segmentation, TCP attempt semantics, synthetic capture
+                    generator, versioned CSV profiles (F)
+  identity/         Address/entity resolution with binding intervals, scope (G)
+  features/         The exact 44/11/24 registry, 30s prefix windows, F.8 transforms
+  graphs/           Collation into the frozen GraphWindowBatch contract (G.2)
+  labels/           Section-11 ontology, D.6 target construction (training-only)
+  data/             Episode corpus, M.1 splits, clip datasets (G.4)
+  models/           GAT encoder, entity GRU, global LSTM, residual transition,
+                    heads, decoders, survival transforms (H)
+  training/         Section-15 objectives (censored survival NLL with the A12
+                    positive-weight correction), curriculum trainer (I.1)
+  calibration/      I.4 affine hazard calibrators (natural-prevalence fit)
+  runtime/          Section-26 inference core + I.5 ensemble
+  sentinel/         J.1 residual/embedding novelty reference and scoring
+  explain/          K.1 grouped-deletion attribution + Tier A candidate edges
+  evaluation/       M.3 event matching, M.4 metrics, gates, bootstrap (M)
+  storage/          SQLite metadata + immutable content-addressed objects (E)
+  api/              FastAPI service: bundle loading (I.6 verified), episode
+                    sessions, sealed forecasts, evidence, reveal (L)
+  cli/              L.4 command surface (doctor, train, evaluate, serve, replay)
+apps/console/       React analyst console — the five K.2 screens
 tests/              Contract/unit tests (Appendix R catalogue IDs in docstrings)
 ```
 
-Module areas owned by other teammates (ingest/, identity/, features/, graphs/,
-labels/, data/, sentinel/, evaluation/, explain/, storage/, api/,
-apps/console/) are added as they are implemented; see the work distribution PDF
-and Build Spec Appendix C.2 for the target layout. The world-model area
-(models, training, calibration, runtime forecast core) is complete and tested
-against synthetic fixtures — the team PDF's "synthetic vertical slice through
-real interfaces" done-criterion passes end to end (tests/unit/test_forecast_engine.py).
-No trained weights yet: real-data training and calibration waits on the
-labels/data modules; the trainer, loss functions and calibrators are ready to
-consume their outputs.
+## Quick start
+
+Python 3.10 with PyTorch (CUDA), PyTorch Geometric, NumPy, PyYAML; the console
+needs Node for building.
+
+```
+# 1. train the Section-35 profile (synthetic corpus, ~1-3 h on an RTX 4060)
+python scripts/train_profile.py
+
+# 2. produce the locked-test evaluation report (M.1-M.5)
+python scripts/evaluate_profile.py
+
+# 3. build the console (once)
+cd apps/console && npm install && npm run build && cd ../..
+
+# 4. serve API + console
+python scripts/serve_console.py        # http://127.0.0.1:8001
+```
+
+Without step 1 the console falls back to untrained reference weights with an
+explicit disclosure on every screen — interface semantics, not performance.
+With it, five independently trained ensemble members (seeds 0-4) run the full
+pipeline: packet telemetry → eligibility-gated windows → the 44/11/24 feature
+registry → calibrated cumulative-risk forecasts with conditional ETAs, sealed
+records with publication receipts, SENTINEL novelty and deletion-tested
+evidence.
+
+## What the demo shows
+
+- **Sessions** — six curated captures (benign baseline, benign drift, and four
+  attack families) through the real pipeline.
+- **Forecast** — cumulative-risk timelines per target with frozen alert
+  thresholds, conditional ETAs with their conditions, entity × target matrix,
+  tactic tags, SENTINEL novelty, sealed record hash.
+- **Evidence** — grouped-deletion attribution with comprehensiveness /
+  sufficiency fidelity against matched random controls; every cited flow is a
+  legal-prefix packet.
+- **Replay** — advance the decision cutoff, forecast, then reveal the withheld
+  ground truth: correct warnings with lead times, misses, false alerts.
+- **Evaluation** — locked-test gates (pass/fail/inconclusive), reliability
+  diagram, per-target average precision, baselines.
+
+## Honesty contract
+
+The corpus is synthetic and disclosed as such. Unsupported targets return
+`not_supported`, never zero. Benign drift triggers novelty without becoming an
+alert. Novelty is unexpectedness, not an attack probability. Deltas from
+deletion are sensitivity, not causal effects. Statistical gates on the
+synthetic corpus are evidence about the corpus, not real-world performance.
 
 ## Environment
-
-Python 3.10 with PyTorch (CUDA), PyTorch Geometric, NumPy, PyYAML.
 
 ```
 python -m pip install -e ".[dev]"
 ```
 
-## Tests
+Run tests with the torch-enabled interpreter (Python 3.10):
 
 ```
-python -m pytest
+python -m pytest tests -q
 ```
-
-Test IDs reference the automated test catalogue in Build Spec Appendix R.3
-(MO01-MO05 model contracts, GR01-GR02 graph batching, ID02 identity
-equivariance, CA01-CA03 calibration math, TR01 censored-likelihood hand
-calculation, TR02 test-split guard, TR03 logging policy, golden examples 1
-and 3, and the Section-26 vertical slice).
-
-## Implementation decision records
-
-- [ADR-001: World Model Implementation Defaults](docs/adr/ADR-001-model-implementation-defaults.md)

@@ -52,3 +52,26 @@ default. This ADR is that record for the world model. Each default cites its spe
 
 Any change to a default in these tables requires a schema/config decision record per
 Build Spec Section 35 and Appendix T.1, plus updated golden fixtures.
+
+## Full-pipeline build (2026-09-11): data, training, serving defaults
+
+| Decision | Default | Spec basis |
+|---|---|---|
+| Transition prior | Residual: `next_memory = memory + MLP([memory ‖ h_top])`, `next_context = context + MLP(h_top)`. A direct regression contracts entity memories toward the pooled mean every rollout step (measured 0.39 → 0.065 std after one transition), erasing entity-specific hazards by bin ~5. Identity-plus-delta preserves discrimination through 60-step rollouts. Shapes unchanged (192→128→64, H.3) | §14, H.3 |
+| Survival positive weight | 50.0 on observed-event bins (weighted mean normalization). Rare events (~0.1% of risk bins) otherwise contribute negligible gradient; the induced odds shift is corrected by the I.4 affine calibrators fitted on natural-prevalence calibration data | §15, A12 |
+| Positive-clip oversampling | Clips with imminent primary-horizon events sampled 4×; probabilities recorded in the run manifest; corrected by I.4 calibration | §15 |
+| Learning rate (this run) | 0.002 (Section-35 default 0.001; development adjustment — rare-event hazard learning converged too slowly at 0.001 on dev) | I.1 |
+| Flag feature semantics | TCP flag counts count PACKETS carrying the bit (`(f & bit) != 0`), never the sum of bit values; applies to node counts 1-6, edge syn/rst counts and global flag fractions | F.6, F.7 |
+| Healthy idle | A present, observation-valid host with no outgoing packets carries valid zeros for flag counts (1-7), unique-destination count and port count; entropy/contiguity/arrival-score stay masked (need ≥2 observations); the bidirectional byte ratio is a valid 1 | F.6 |
+| Cutoff grid (training corpus) | Every second window from 20 to 80: full 60-bin targets for cutoffs ≤ 50, censored follow-up beyond; primary-horizon follow-up complete for every cutoff | G.4, §15 |
+| Batched training | `Trainer.batched_step` stacks B=16 clips per timestep (`graphs.stack_windows`), one forward/backward through the shared batched graph, per-clip D.6 losses averaged (each already valid-count normalized); the frozen per-clip target contract is preserved by slicing the batched rollout outputs | §35 batch_clips, D.6, G.2 |
+| Campaign timing | Attack campaigns start t0 ∈ [11, 17] min so first-contact/initial-access events fall inside the future of early cutoffs (earliest cutoff = window 20 = 10 min) | §11, G.4 |
+| Serving path | `build_serving_windows` produces scaled windows + the frozen all-pairs candidate set WITHOUT the training target object; the serving loader never instantiates `ClipTargets` | C.2, G.4 |
+| Ensemble disagreement | Exact-equality shortcut (`max == min → 0.0`): the float mean of identical occurrences differs by an ulp, which faked ~1e-16 disagreement for identical members | I.5 |
+| Novelty reference | Robust per-feature-group median/MAD of matured residuals over benign train clips + diagonal embedding reference; residual thresholds 3.0 standardized units; benign change is change detection only | J.1, A09 |
+| Sentinel input law | `MaturedResidual` enforces `observed_window > forecast_cutoff_window` at construction (NO01) | J.1, NO01 |
+| Alert policy | Per-task thresholds fitted on the calibration split at the 1-false-alert-per-100-asset-hours budget over non-overlapping cutoffs (cutoff % 10 == 0); unreachable budget → `budget_unreachable` abstention (no threshold, no alerts) | §29, M.3, M.4 |
+| Evaluation matching | 300 s per-(entity, task) cooldown on alert issuance; one alert matches at most one event; events beyond the horizon make an alert evaluable-false; no later event → outcome unknown unless follow-up complete | M.3, EV01, EV02 |
+| Evidence attribution budget | 12 window-deletion groups + 6 matched random controls + top-4 selection per explanation; partial results flagged | K.1 |
+| Episode corpus | 72 episodes / 6 families (16 benign-baseline, 10 benign-drift, 14 web-to-lateral, 12 c2-exfil, 10 slow-recon, 10 cred-spray); every 9th episode carries a 2-minute sensor gap; 1.2% late arrivals (3-8 min receipt delay) | §6, C.4, §18 |
+| Splits | Family-balanced deterministic interleave, whole-episode units, 60/15/10/15 with the M.1 embargo recorded; never row-level | M.1 |

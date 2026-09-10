@@ -59,12 +59,22 @@ def _count(mask: Tensor) -> int:
 
 
 def masked_survival_nll(
-    hazard_logits: Tensor, event_y: Tensor, risk_mask: Tensor
+    hazard_logits: Tensor,
+    event_y: Tensor,
+    risk_mask: Tensor,
+    *,
+    positive_weight: float = 1.0,
 ) -> tuple[Tensor, int]:
     """Censored-discrete-time survival NLL over valid risk bins.
 
     ``hazard_logits``/``event_y``/``risk_mask`` share shape ``[..., H, J]``.
     Returns ``(loss_scalar, valid_bin_count)``.
+
+    ``positive_weight`` (Section 15) up-weights observed-event bins so rare
+    events still shape the hazard head. It shifts the optimum odds by ``w``
+    and the shift is corrected downstream by the I.4 affine calibrator
+    fitted on natural-prevalence calibration data (A12) — the run manifest
+    records the weight.
     """
     if not (hazard_logits.shape == event_y.shape == risk_mask.shape):
         raise ContractError(
@@ -77,7 +87,12 @@ def masked_survival_nll(
     log_1mq = nn.functional.logsigmoid(-hazard_logits)   # log(1 - q)
     per_bin = event_y * log_q + (1.0 - event_y) * log_1mq
     n = _count(risk_mask)
-    loss = -(mask * per_bin).sum() / max(1, n)
+    if positive_weight != 1.0:
+        bin_weight = 1.0 + event_y * (positive_weight - 1.0)
+        weighted = mask * bin_weight
+        loss = -(weighted * per_bin).sum() / weighted.sum().clamp(min=1.0)
+    else:
+        loss = -(mask * per_bin).sum() / max(1, n)
     return loss, n
 
 
@@ -256,13 +271,19 @@ def _stack_steps(outputs: list[DecodedStep]) -> dict[str, Tensor]:
 
 
 def compute_clip_loss(
-    outputs: list[DecodedStep], targets: ClipTargets, weights: LossWeights
+    outputs: list[DecodedStep],
+    targets: ClipTargets,
+    weights: LossWeights,
+    *,
+    positive_weight: float = 1.0,
 ) -> LossBreakdown:
     """Combined Section-15 objective for one clip's rollout.
 
     ``outputs`` may cover fewer bins than the targets' full horizon (curriculum
     rollouts train only on the bins they produce; Section 15 rollout curriculum).
     Unsupported tasks (``task_mask`` False) are masked from the losses (D.6).
+    ``positive_weight`` up-weights observed-event bins in the survival term
+    (Section 15 imbalance correction; corrected by I.4 calibration).
     """
     s = _stack_steps(outputs)
     H_roll = s["hazard_logits"].shape[0]
@@ -277,7 +298,9 @@ def compute_clip_loss(
     hazard_logits = s["hazard_logits"].permute(1, 0, 2)
     event_y = targets.event_y[:, :H_roll, :].to(hazard_logits.dtype)
     risk_mask = targets.risk_mask[:, :H_roll, :] & targets.task_mask
-    survival, survival_n = masked_survival_nll(hazard_logits, event_y, risk_mask)
+    survival, survival_n = masked_survival_nll(
+        hazard_logits, event_y, risk_mask, positive_weight=positive_weight
+    )
     bin_summary = per_bin_survival_nll(hazard_logits, event_y, risk_mask)
 
     tactic_logits = s["tactic_logits"].permute(1, 0, 2)  # [N, H', 5]

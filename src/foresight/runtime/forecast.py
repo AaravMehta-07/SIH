@@ -304,11 +304,16 @@ class EnsembleForecaster:
                 occurrences = [
                     float(d.cumulative_risk[-1]) for d in member_dists
                 ]
-                mean_occ = sum(occurrences) / len(occurrences)
-                spread = math.sqrt(
-                    sum((o - mean_occ) ** 2 for o in occurrences)
-                    / len(occurrences)
-                )
+                if max(occurrences) == min(occurrences):
+                    spread = 0.0  # exact-equality shortcut: the float mean of
+                    # identical values differs by an ulp, which would fake a
+                    # ~1e-16 disagreement for identical members
+                else:
+                    mean_occ = sum(occurrences) / len(occurrences)
+                    spread = math.sqrt(
+                        sum((o - mean_occ) ** 2 for o in occurrences)
+                        / len(occurrences)
+                    )
                 disagreement[(entity.slot, tf.task_index)] = spread
                 task_forecasts.append(
                     TaskForecast(

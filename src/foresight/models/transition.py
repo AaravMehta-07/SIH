@@ -41,6 +41,16 @@ def masked_mean_max_pool(entity_memory: Tensor, node_present: Tensor) -> Tensor:
 
 
 class TransitionPrior(nn.Module):
+    """Residual transition (ADR-001): ``next = current + MLP([current || h_top])``.
+
+    A direct regression contracts entity memories toward the pooled mean at
+    every rollout step (measured: per-entity memory std 0.39 -> 0.065 after a
+    single transition), which erases entity-specific hazards by bin ~5. The
+    residual parameterization predicts the *change* — identity-plus-delta —
+    so entity discrimination survives long free rollouts. Shapes follow H.3
+    exactly: 192 -> 128 -> 64 with ELU between linear layers.
+    """
+
     def __init__(
         self,
         entity_dim: int,
@@ -79,8 +89,8 @@ class TransitionPrior(nn.Module):
             ],
             dim=-1,
         )
-        entity_next = self.entity_mlp(endpoint)  # [B, N, 64]
-        global_next = self.global_mlp(h_top)  # [B, 24]
+        entity_next = state.entity_memory + self.entity_mlp(endpoint)  # [B, N, 64]
+        global_next = state.global_context + self.global_mlp(h_top)    # [B, 24]
         pooled = masked_mean_max_pool(entity_next, state.node_present)  # [B, 128]
         lstm_input = torch.cat([pooled, global_next], dim=-1)  # [B, 152]
         return entity_next, global_next, lstm_input
