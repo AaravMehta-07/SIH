@@ -4,11 +4,11 @@ A clip is one decision cutoff on the 30-second grid: 20 eligible history
 windows (prefix) plus the training-only future targets (labels module; the
 serving path never instantiates the target object — Appendix C.2).
 
-Cutoffs are sampled every second grid window from the 20th to the
-(EPISODE_WINDOWS - 60)th window, so pre-event, imminent-event and
-post-event phases are all covered. Overlapping cutoffs are training
-exposure, never independent evaluation units (G.4); the evaluator counts
-alerts with cooldown and bootstraps at episode level (M.3/M.4).
+Cutoffs span windows 20..80 (pre-event, imminent-event and post-onset phases
+for every task; every cutoff has complete primary-horizon follow-up).
+Overlapping cutoffs are training exposure, never independent evaluation
+units (G.4); the evaluator counts alerts with cooldown and bootstraps at
+episode level (M.3/M.4). Strides are a memory/compute budget choice.
 """
 
 from __future__ import annotations
@@ -35,14 +35,22 @@ WINDOW_NS = 30 * _NS
 HISTORY_WINDOWS = 20
 HORIZON_BINS = 60
 
-#: Cutoff grid: every fourth window from 20 to 80 (16 per episode). The
-#: stride is a memory/compute budget choice — highly overlapping cutoffs
-#: are training exposure, never independent units (G.4); stride 4 keeps
-#: non-overlapping primary horizons and complete event-phase coverage.
-CUTOFF_STEP = 4
+#: Cutoff grid defaults (1-based window indices, 20..80). The stride is a
+#: memory/compute budget choice — highly overlapping cutoffs are training
+#: exposure, never independent units (G.4). Training uses stride 8 (344
+#: clips: enough signal — a 372-clip probe reached AP 0.26); calibration and
+#: locked-test use stride 10, which lands every cutoff on the non-overlapping
+#: primary-horizon grid the alert policy and M.3 accounting require.
+CUTOFF_STEP = 8
+CUTOFF_STEP_EVAL = 10
 
 
-def sample_cutoffs(episode: Episode, *, horizon: int = HORIZON_BINS) -> list[int]:
+def sample_cutoffs(
+    episode: Episode,
+    *,
+    horizon: int = HORIZON_BINS,
+    stride: int = CUTOFF_STEP,
+) -> list[int]:
     """Grid window indices (1-based window count) usable as cutoffs.
 
     Cutoffs run from the first full-history window (20) to window 80: every
@@ -52,7 +60,7 @@ def sample_cutoffs(episode: Episode, *, horizon: int = HORIZON_BINS) -> list[int
     imminent-event and post-onset phases for every task.
     """
     last = 80
-    return list(range(HISTORY_WINDOWS, last + 1, CUTOFF_STEP))
+    return list(range(HISTORY_WINDOWS, last + 1, stride))
 
 
 @dataclass
@@ -209,12 +217,14 @@ class ClipDataset:
         scaler: FeatureScaler,
         cache_dir: Path | None = None,
         horizon: int = HORIZON_BINS,
+        stride: int | None = None,
     ) -> None:
         self.episodes = episodes
         self.split = split
         self.scaler = scaler
         self.cache_dir = cache_dir
         self.horizon = horizon
+        self.stride = stride
         self._examples: list[ClipExample] | None = None
 
     def _cache_path(self, episode: Episode) -> Path | None:
@@ -227,7 +237,11 @@ class ClipDataset:
 
     def _load_or_build(self, episode: Episode) -> list[ClipExample]:
         cache = self._cache_path(episode)
-        wanted = set(sample_cutoffs(episode, horizon=self.horizon))
+        wanted = set(
+            sample_cutoffs(
+                episode, horizon=self.horizon, stride=self.stride or CUTOFF_STEP
+            )
+        )
         if cache is not None and cache.exists():
             with open(cache, "rb") as handle:
                 # Older cache entries may carry a denser cutoff grid; the

@@ -26,6 +26,7 @@ measured-performance claim beyond these gates is made.
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import random
@@ -46,6 +47,7 @@ from foresight.calibration.hazard import (  # noqa: E402
     fit_hazard_calibrator,
 )
 from foresight.data.clips import (  # noqa: E402
+    CUTOFF_STEP_EVAL,
     ClipDataset,
     ClipExample,
 )
@@ -431,19 +433,31 @@ def main() -> None:
 
     # ---- 2. scaler on train prefix windows ---------------------------------
     print("[2/8] fitting F.8 scaler on train split...", flush=True)
-    train_ds = ClipDataset(
-        list(splits.train), split="train", scaler=None, cache_dir=args.cache
-    )
-    scaler = train_ds.fit_scaler_from_train()
     args.out.mkdir(parents=True, exist_ok=True)
-    (args.out / "scaler.json").write_text(scaler.serialize(), encoding="utf-8")
+    scaler_path = args.out / "scaler.json"
+    if scaler_path.exists():
+        # Fit once per corpus; per-seed invocations reuse the frozen fit
+        # (F.8: never fit per run, let alone per upload).
+        scaler = FeatureScaler.from_json(
+            json.loads(scaler_path.read_text(encoding="utf-8"))
+        )
+        print("  scaler loaded from cache", flush=True)
+    else:
+        train_ds = ClipDataset(
+            list(splits.train), split="train", scaler=None, cache_dir=args.cache
+        )
+        scaler = train_ds.fit_scaler_from_train()
+        del train_ds
+        gc.collect()
+        scaler_path.write_text(scaler.serialize(), encoding="utf-8")
 
     # ---- 3. clip examples (staged for memory: train+dev now, cal/test later)
     print("[3/8] building clip examples (cached)...", flush=True)
 
-    def load_examples(split_name: str, episodes_list) -> list:
+    def load_examples(split_name: str, episodes_list, stride=None) -> list:
         ds = ClipDataset(
-            episodes_list, split=split_name, scaler=scaler, cache_dir=args.cache
+            episodes_list, split=split_name, scaler=scaler,
+            cache_dir=args.cache, stride=stride,
         )
         return ds.examples()
 
@@ -455,13 +469,13 @@ def main() -> None:
         events = sum(int(ex.targets.event_y.sum()) for ex in examples[name])
         print(f"  {name}: {len(examples[name])} clips, {events} events", flush=True)
 
-    dev_monitor = [
-        ex for ex in examples["development"] if ex.cutoff_window % 4 == 0
-    ]
+    # Full dev set at the training stride (88 clips at stride 8) — a
+    # modulo sub-filter can silently match nothing when the stride and the
+    # modulus share factors (caught live: stride-8 cutoffs are all 4 mod 8).
+    dev_monitor = examples["development"]
     rng = random.Random(0)
 
     # ---- 4. per-seed training (checkpointed; resumable) ----------------------
-    import gc
 
     partial_dir = args.out / "partial"
     partial_dir.mkdir(parents=True, exist_ok=True)
@@ -469,20 +483,34 @@ def main() -> None:
     run_summaries: dict[int, dict] = {}
     for seed in args.seeds:
         checkpoint = partial_dir / f"seed{seed}.pt"
+        resume = None
         if checkpoint.exists():
-            payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-            members[seed] = payload["state"]
-            run_summaries[seed] = payload["summary"]
+            resume = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            summary = resume["summary"]
+            if resume.get("final", False):
+                members[seed] = resume["state"]
+                run_summaries[seed] = summary
+                print(
+                    f"[4/8] seed={seed}: checkpoint found (best epoch "
+                    f"{summary['best_epoch']}, devAP "
+                    f"{summary['best_dev_mean_ap']:.3f}) - skipping",
+                    flush=True,
+                )
+                continue
             print(
-                f"[4/8] seed={seed}: checkpoint found (best epoch "
-                f"{payload['summary']['best_epoch']}, devAP "
-                f"{payload['summary']['best_dev_mean_ap']:.3f}) - skipping",
+                f"[4/8] seed={seed}: resuming from epoch "
+                f"{summary['epochs'][-1]['epoch']} (best "
+                f"{summary['best_epoch']}, devAP "
+                f"{summary['best_dev_mean_ap']:.3f})",
                 flush=True,
             )
-            continue
         print(f"[4/8] training member seed={seed}...", flush=True)
         set_seed(seed)
         model = ForesightWorldModel.from_config(config, num_event_tasks=5).to(device)
+        if resume is not None:
+            model.load_state_dict(
+                {k: v.to(device) for k, v in resume["state"].items()}
+            )
         trainer = Trainer(
             model=model,
             weights=LossWeights.from_config(config.training["loss"]),
@@ -510,12 +538,38 @@ def main() -> None:
             ]
         )
         clip_probs = clip_weights / clip_weights.sum()
-        best_ap = -1.0
-        best_epoch = 0
-        best_state = None
-        epochs_no_improve = 0
-        epoch_logs = []
-        for epoch in range(1, args.epochs + 1):
+
+        def run_summary_so_far() -> dict:
+            return {
+                "best_epoch": best_epoch,
+                "best_dev_mean_ap": best_ap,
+                "curriculum_transitions": list(CURRICULUM_TRANSITIONS),
+                "sampling_policy": (
+                    f"positive_clip_oversampling({POSITIVE_CLIP_OVERSAMPLING}x) "
+                    f"+ survival positive_weight({SURVIVAL_POSITIVE_WEIGHT}) "
+                    "with recorded probabilities; base-rate/odds shift "
+                    "corrected by I.4 natural-prevalence calibration "
+                    "(Section 15, A12)"
+                ),
+                "epochs": epoch_logs,
+            }
+
+        if resume is not None:
+            best_ap = resume["summary"]["best_dev_mean_ap"]
+            best_epoch = resume["summary"]["best_epoch"]
+            best_state = resume["state"]
+            epochs_no_improve = resume.get("epochs_no_improve", 0)
+            epoch_logs = resume["summary"]["epochs"]
+            trainer.optimizer.load_state_dict(resume["optimizer"])
+            start_epoch = epoch_logs[-1]["epoch"] + 1
+        else:
+            best_ap = -1.0
+            best_epoch = 0
+            best_state = None
+            epochs_no_improve = 0
+            epoch_logs = []
+            start_epoch = 1
+        for epoch in range(start_epoch, args.epochs + 1):
             horizon = trainer.curriculum.horizon_for_epoch(epoch)
             order = list(
                 np.random.default_rng(seed * 1000 + epoch).choice(
@@ -571,6 +625,19 @@ def main() -> None:
                 )
                 epochs_no_improve = 0
                 marker = " *"
+                # Bank progress on every improvement: an interrupted run
+                # resumes from the last best epoch (I.1), losing at most the
+                # epoch in flight.
+                torch.save(
+                    {
+                        "state": best_state,
+                        "optimizer": trainer.optimizer.state_dict(),
+                        "summary": run_summary_so_far(),
+                        "epochs_no_improve": epochs_no_improve,
+                        "final": False,
+                    },
+                    checkpoint,
+                )
             else:
                 epochs_no_improve += 1
             print(
@@ -595,9 +662,13 @@ def main() -> None:
             ),
             "epochs": epoch_logs,
         }
-        # Per-seed checkpoint: an interrupted run resumes here (I.1).
+        # Final checkpoint for this seed: complete, do not resume into it.
         torch.save(
-            {"state": best_state, "summary": run_summaries[seed]},
+            {
+                "state": best_state,
+                "summary": run_summaries[seed],
+                "final": True,
+            },
             checkpoint,
         )
         print(f"  checkpoint saved: {checkpoint}", flush=True)
@@ -628,7 +699,7 @@ def main() -> None:
     # ---- 5. calibrators -------------------------------------------------------
     print("[5/8] fitting I.4 calibrators on calibration split...", flush=True)
     examples["calibration"] = load_examples(
-        "calibration", list(splits.calibration)
+        "calibration", list(splits.calibration), stride=CUTOFF_STEP_EVAL
     )
     print(
         f"  calibration: {len(examples['calibration'])} clips, "
@@ -692,7 +763,7 @@ def main() -> None:
     del examples["calibration"]
     gc.collect()
     examples["locked_test"] = load_examples(
-        "locked_test", list(splits.locked_test)
+        "locked_test", list(splits.locked_test), stride=CUTOFF_STEP_EVAL
     )
     print(
         f"  locked test: {len(examples['locked_test'])} clips, "
