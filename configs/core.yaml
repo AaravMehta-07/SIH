@@ -1,0 +1,60 @@
+schema: foresight.core.2026-09
+system:
+  name: FORESIGHT
+  offline: true
+  action_mode: disabled
+data:
+  window_seconds: 30
+  history_windows: 20
+  modeled_horizon_bins: 60
+  evaluated_horizon_bins: [10, 30, 60]
+  primary_horizon_bins: 10
+  max_nodes_per_graph: 128
+  split_unit: campaign_episode
+  split_proportions: [0.60, 0.15, 0.10, 0.15]
+  embargo_seconds: 2400
+  retain_precursor_attack_history: true
+features:
+  node_values: 44
+  node_validity: 44
+  node_input: 88
+  edge_values: 11
+  edge_validity: 11
+  edge_input: 22
+  global_values: 24
+  global_validity: 24
+  global_input: 48
+  global_adapter_output: 24
+model:
+  entity_embedding: 64
+  entity_gru_hidden: 64
+  global_lstm_input: 152
+  global_lstm_hidden: 128
+  global_lstm_layers: 2
+  endpoint_head_input: 192
+  edge_head_input: 256
+  latent_noise: disabled
+training:
+  epochs_max: 40
+  batch_clips: 16
+  optimizer: AdamW
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  rollout_curriculum: [1, 3, 10, 30, 60]
+  loss: {survival: 1.0, observable: 0.5, edge: 0.2, stage: 0.2}
+  seeds: [0, 1, 2, 3, 4]
+  benign_pretraining: challenger_only
+evaluation:
+  alert_cooldown_seconds: 300
+  false_alerts_per_100_asset_hours_max: 1.0
+  primary_event_recall_min: 0.50
+  ece_max: 0.05
+  compute_to_ledger_p95_seconds_max: 2.0
+  compute_to_ledger_p99_seconds_max: 5.0
+  process_memory_gib_max: 8
+  final_test_model_selection: prohibited
+release:
+  measured_results_required: true
+  supported_tasks_from_manifest: true
+  auto_promote_research: false

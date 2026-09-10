@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Generated artifacts (Build Spec C.2/C.4: never commit generated or large artifacts)
+artifacts/
+reports/
+tmp/
+*.safetensors
+*.pt
+*.pth
+*.npz
+*.parquet
+*.pcap
+*.pcapng
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
