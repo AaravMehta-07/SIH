@@ -35,8 +35,11 @@ WINDOW_NS = 30 * _NS
 HISTORY_WINDOWS = 20
 HORIZON_BINS = 60
 
-#: Cutoff grid: every second window from 20 to (110 - 60).
-CUTOFF_STEP = 2
+#: Cutoff grid: every fourth window from 20 to 80 (16 per episode). The
+#: stride is a memory/compute budget choice — highly overlapping cutoffs
+#: are training exposure, never independent units (G.4); stride 4 keeps
+#: non-overlapping primary horizons and complete event-phase coverage.
+CUTOFF_STEP = 4
 
 
 def sample_cutoffs(episode: Episode, *, horizon: int = HORIZON_BINS) -> list[int]:
@@ -224,9 +227,16 @@ class ClipDataset:
 
     def _load_or_build(self, episode: Episode) -> list[ClipExample]:
         cache = self._cache_path(episode)
+        wanted = set(sample_cutoffs(episode, horizon=self.horizon))
         if cache is not None and cache.exists():
             with open(cache, "rb") as handle:
-                return pickle.load(handle)
+                # Older cache entries may carry a denser cutoff grid; the
+                # active stride governs what the dataset exposes (G.4).
+                return [
+                    ex
+                    for ex in pickle.load(handle)
+                    if ex.cutoff_window in wanted
+                ]
         pre = precompute_episode(episode)
         examples = [
             build_clip_example(

@@ -438,32 +438,48 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "scaler.json").write_text(scaler.serialize(), encoding="utf-8")
 
-    # ---- 3. clip examples ----------------------------------------------------
+    # ---- 3. clip examples (staged for memory: train+dev now, cal/test later)
     print("[3/8] building clip examples (cached)...", flush=True)
-    datasets = {
-        "train": ClipDataset(list(splits.train), split="train", scaler=scaler, cache_dir=args.cache),
-        "development": ClipDataset(list(splits.development), split="development", scaler=scaler, cache_dir=args.cache),
-        "calibration": ClipDataset(list(splits.calibration), split="calibration", scaler=scaler, cache_dir=args.cache),
-        "locked_test": ClipDataset(list(splits.locked_test), split="locked_test", scaler=scaler, cache_dir=args.cache),
-    }
-    examples = {
-        name: ds.examples() for name, ds in datasets.items()
-    }
-    for name, exs in examples.items():
-        events = sum(
-            int(ex.targets.event_y.sum()) for ex in exs
+
+    def load_examples(split_name: str, episodes_list) -> list:
+        ds = ClipDataset(
+            episodes_list, split=split_name, scaler=scaler, cache_dir=args.cache
         )
-        print(f"  {name}: {len(exs)} clips, {events} in-horizon events", flush=True)
+        return ds.examples()
+
+    examples: dict[str, list] = {
+        "train": load_examples("train", list(splits.train)),
+        "development": load_examples("development", list(splits.development)),
+    }
+    for name in ("train", "development"):
+        events = sum(int(ex.targets.event_y.sum()) for ex in examples[name])
+        print(f"  {name}: {len(examples[name])} clips, {events} events", flush=True)
 
     dev_monitor = [
         ex for ex in examples["development"] if ex.cutoff_window % 4 == 0
     ]
     rng = random.Random(0)
 
-    # ---- 4. per-seed training -------------------------------------------------
+    # ---- 4. per-seed training (checkpointed; resumable) ----------------------
+    import gc
+
+    partial_dir = args.out / "partial"
+    partial_dir.mkdir(parents=True, exist_ok=True)
     members: dict[int, OrderedDict] = {}
     run_summaries: dict[int, dict] = {}
     for seed in args.seeds:
+        checkpoint = partial_dir / f"seed{seed}.pt"
+        if checkpoint.exists():
+            payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            members[seed] = payload["state"]
+            run_summaries[seed] = payload["summary"]
+            print(
+                f"[4/8] seed={seed}: checkpoint found (best epoch "
+                f"{payload['summary']['best_epoch']}, devAP "
+                f"{payload['summary']['best_dev_mean_ap']:.3f}) - skipping",
+                flush=True,
+            )
+            continue
         print(f"[4/8] training member seed={seed}...", flush=True)
         set_seed(seed)
         model = ForesightWorldModel.from_config(config, num_event_tasks=5).to(device)
@@ -579,10 +595,46 @@ def main() -> None:
             ),
             "epochs": epoch_logs,
         }
-        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+        # Per-seed checkpoint: an interrupted run resumes here (I.1).
+        torch.save(
+            {"state": best_state, "summary": run_summaries[seed]},
+            checkpoint,
+        )
+        print(f"  checkpoint saved: {checkpoint}", flush=True)
+        del model, trainer
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # Free training memory before the calibration/prediction stages.
+    del examples["train"]
+    del dev_monitor
+    gc.collect()
+
+    # Sequential-seed mode: when other seeds' checkpoints are still pending,
+    # exit here — the final invocation (all checkpoints present) assembles
+    # calibrators, policy, predictions and the bundle.
+    pending = [
+        s for s in SEEDS if not (partial_dir / f"seed{s}.pt").exists()
+    ]
+    if pending:
+        print(
+            f"[resume] pending seeds {pending}; exiting after training stage "
+            "(re-run per seed; the final run assembles the bundle)",
+            flush=True,
+        )
+        return
 
     # ---- 5. calibrators -------------------------------------------------------
     print("[5/8] fitting I.4 calibrators on calibration split...", flush=True)
+    examples["calibration"] = load_examples(
+        "calibration", list(splits.calibration)
+    )
+    print(
+        f"  calibration: {len(examples['calibration'])} clips, "
+        f"{sum(int(ex.targets.event_y.sum()) for ex in examples['calibration'])} events",
+        flush=True,
+    )
     engines: list[ForecastEngine] = []
     calibrators_payload: dict[str, dict] = {}
     for seed in args.seeds:
@@ -637,10 +689,23 @@ def main() -> None:
 
     # ---- 7. locked-test predictions --------------------------------------------
     print("[7/8] running I.5 ensemble over locked test...", flush=True)
+    del examples["calibration"]
+    gc.collect()
+    examples["locked_test"] = load_examples(
+        "locked_test", list(splits.locked_test)
+    )
+    print(
+        f"  locked test: {len(examples['locked_test'])} clips, "
+        f"{sum(int(ex.targets.event_y.sum()) for ex in examples['locked_test'])} events",
+        flush=True,
+    )
     predictions = predict_locked_test(
         calibrated_engines, device, examples["locked_test"]
     )
     print(f"  {len(predictions)} prediction records", flush=True)
+    del examples["locked_test"]
+    del examples["development"]
+    gc.collect()
 
     # ---- 8. novelty reference (J.1) + bundle ---------------------------------
     print("[8/8] fitting novelty reference and assembling I.6 bundle...", flush=True)
@@ -648,7 +713,8 @@ def main() -> None:
     from foresight.sentinel.reference import fit_novelty_reference
 
     benign_train = [
-        ex for ex in examples["train"]
+        ex
+        for ex in load_examples("train", list(splits.train))
         if ex.family in ("benign", "benign-drift")
     ]
     if benign_train:
