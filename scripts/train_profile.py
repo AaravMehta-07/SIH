@@ -823,12 +823,15 @@ def main() -> None:
     del dev_monitor
     gc.collect()
 
-    # Sequential-member mode: when other members' checkpoints are still
-    # pending, exit here — the final invocation (all checkpoints present)
-    # assembles calibrators, policy, predictions and the bundle.
+    # Sequential-member mode: the bundle is assembled ONLY when every member
+    # of the FULL default plan has a final checkpoint — a partial-plan run
+    # (parallel member training) exits after its own members so it can never
+    # write a partial-member manifest. The completing run assembles over the
+    # full member set, not just its own plan.
+    full_plan = parse_members(DEFAULT_MEMBERS)
     pending = [
         f"{v}:{s}"
-        for v, s in plan
+        for v, s in full_plan
         if not member_checkpoint(partial_dir, v, s).exists()
     ]
     if pending:
@@ -838,6 +841,28 @@ def main() -> None:
             flush=True,
         )
         return
+    if set(plan) != set(full_plan):
+        print(
+            "[assembly] all members present; assembling the FULL member set "
+            f"({len(full_plan)} members)",
+            flush=True,
+        )
+        plan = list(full_plan)
+        for v, s in plan:
+            if (v, s) not in members:
+                ck = torch.load(
+                    member_checkpoint(partial_dir, v, s),
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                members[(v, s)] = ck["state"]
+                run_summaries[f"{v}:{s}"] = ck["summary"]
+                print(
+                    f"[assembly] loaded {v}:{s} from checkpoint "
+                    f"(best epoch {ck['summary']['best_epoch']}, devAP "
+                    f"{ck['summary']['best_dev_mean_ap']:.3f})",
+                    flush=True,
+                )
 
     # ---- 5. calibrators -------------------------------------------------------
     print("[5/8] fitting I.4 calibrators on calibration split...", flush=True)
