@@ -91,6 +91,7 @@ def evaluate_locked_test(
     train_event_y=None,
     train_risk_mask=None,
     bootstrap_seed: int = 0,
+    independent_units: int | None = None,
 ) -> EvaluationReport:
     """Score frozen predictions on the locked test split (M.3-M.5).
 
@@ -177,6 +178,7 @@ def evaluate_locked_test(
 
     # ---- baselines (same legal information) --------------------------------
     baseline_payload = {}
+    empirical_brier = None
     if train_event_y is not None and train_risk_mask is not None:
         emp = EmpiricalHazardBaseline()
         emp.fit(train_event_y, train_risk_mask)
@@ -188,6 +190,17 @@ def evaluate_locked_test(
             "persistence/empirical hazard floor; the world model must beat "
             "this floor to justify learned dynamics (Section 29)"
         )
+        baseline_risks: list[float] = []
+        baseline_outcomes: list[int] = []
+        for p in predictions:
+            if p["event_bin"] is None and p["risk_mask_bins"] >= PRIMARY_HORIZON:
+                baseline_risks.append(emp.cumulative_risk(p["task"], PRIMARY_HORIZON))
+                baseline_outcomes.append(0)
+            elif p["event_bin"] is not None and p["event_bin"] <= PRIMARY_HORIZON:
+                baseline_risks.append(emp.cumulative_risk(p["task"], PRIMARY_HORIZON))
+                baseline_outcomes.append(1)
+        empirical_brier = brier_scores(baseline_risks, baseline_outcomes)["brier"]
+        baseline_payload["empirical_hazard_brier_300s"] = empirical_brier
     report.baselines = baseline_payload
 
     # ---- per-family and per-task slices (M.4) ------------------------------
@@ -269,7 +282,11 @@ def evaluate_locked_test(
     }
 
     # ---- gates (M.5: statistical targets; honest inconclusive on few units) -
-    n_test_units = len({p["episode_id"] for p in predictions})
+    n_test_units = (
+        independent_units
+        if independent_units is not None
+        else len({p["episode_id"] for p in predictions})
+    )
     report.gates = [
         _gate("event_recall_min", recall, 0.50, units=n_test_units, min_units=5),
         _gate(
@@ -286,13 +303,18 @@ def evaluate_locked_test(
         report.gates.append(
             GateStatus(
                 "brier_vs_baseline",
-                "inconclusive" if n_test_units < 5 else "pass",
+                (
+                    "inconclusive"
+                    if n_test_units < 5 or empirical_brier is None
+                    else "pass" if brier["brier"] < empirical_brier else "fail"
+                ),
                 brier["brier"],
-                None,
+                empirical_brier,
                 reason=(
-                    "Brier compared against the empirical-hazard baseline in "
-                    "`baselines`; a formal paired comparison runs in the "
-                    "benchmark harness (Section 29)"
+                    "too few independent units for a comparison claim"
+                    if n_test_units < 5 else
+                    "model Brier must be lower than the training-only "
+                    "empirical-hazard baseline (Section 29)"
                 ),
             )
         )

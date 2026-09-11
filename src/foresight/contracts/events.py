@@ -150,6 +150,54 @@ class PacketObservables:
 
 
 @dataclass(frozen=True)
+class FlowObservables:
+    """Typed ``flow_segment_closed`` payload (F.2/F.4).
+
+    Counts are completed-flow observations.  Directional packet counts are
+    optional because CTU-13 publishes only the bidirectional total; callers
+    must leave them ``None`` rather than allocating packets to a direction.
+    """
+
+    src_address: str
+    dst_address: str
+    protocol: str
+    src_port: int | None
+    dst_port: int | None
+    direction: str
+    duration_ns: int
+    total_packets: int
+    total_bytes: int
+    src_bytes: int
+    dst_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.protocol not in ("tcp", "udp", "other"):
+            raise CanonicalJSONError(f"unknown protocol {self.protocol!r}")
+        if self.duration_ns < 0:
+            raise CanonicalJSONError("duration_ns must be nonnegative")
+        for name in ("total_packets", "total_bytes", "src_bytes", "dst_bytes"):
+            if getattr(self, name) < 0:
+                raise CanonicalJSONError(f"{name} must be nonnegative")
+        if self.src_bytes + self.dst_bytes != self.total_bytes:
+            raise CanonicalJSONError("directional byte totals must conserve total_bytes")
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "src_address": self.src_address,
+            "dst_address": self.dst_address,
+            "protocol": self.protocol,
+            "src_port": self.src_port,
+            "dst_port": self.dst_port,
+            "direction": self.direction,
+            "duration_ns": str(self.duration_ns),
+            "total_packets": self.total_packets,
+            "total_bytes": self.total_bytes,
+            "src_bytes": self.src_bytes,
+            "dst_bytes": self.dst_bytes,
+        }
+
+
+@dataclass(frozen=True)
 class SecurityEvent:
     """D.3 canonical normalized event.
 
@@ -163,7 +211,7 @@ class SecurityEvent:
     event_id: str
     sensor_id: str
     event_kind: str
-    observables: PacketObservables | dict[str, Any]
+    observables: PacketObservables | FlowObservables | dict[str, Any]
     event_time_lower_ns: int
     event_time_upper_ns: int
     available_at_ns: int
@@ -202,6 +250,12 @@ class SecurityEvent:
             raise CanonicalJSONError(
                 "packet_observed events require PacketObservables"
             )
+        if self.event_kind == "flow_segment_closed" and not isinstance(
+            self.observables, FlowObservables
+        ):
+            raise CanonicalJSONError(
+                "flow_segment_closed events require FlowObservables"
+            )
 
     # -- Section 7 cutoff eligibility (single implementation, TM02/TM03) ----
     def eligible_at(self, cutoff_ns: int) -> bool:
@@ -220,7 +274,7 @@ class SecurityEvent:
     def to_json(self) -> dict[str, Any]:
         obs = (
             self.observables.to_json()
-            if isinstance(self.observables, PacketObservables)
+            if isinstance(self.observables, (PacketObservables, FlowObservables))
             else dict(self.observables)
         )
         return {
@@ -256,7 +310,7 @@ def build_event(
     event_id: str,
     sensor_id: str,
     event_kind: str,
-    observables: PacketObservables | dict[str, Any],
+    observables: PacketObservables | FlowObservables | dict[str, Any],
     event_time_ns: int,
     available_delay_ns: int = 0,
     ingest_delay_ns: int = 0,

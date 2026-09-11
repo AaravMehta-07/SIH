@@ -1,0 +1,18 @@
+{
+  "schema_version": "foresight.release.v1",
+  "release_id": "foresight-tier-a-b-2026-09",
+  "schema": "foresight.core.2026-09",
+  "bundles": [
+    {
+      "label": "synthetic profile (Section 35)",
+      "path": "artifacts/profile",
+      "optional": false
+    },
+    {
+      "label": "CTU-13 real-flow transfer profile",
+      "path": "artifacts/ctu13/profile",
+      "optional": true
+    }
+  ],
+  "note": "Optional bundles are skipped, not failed, when not yet trained; every present bundle must verify."
+}

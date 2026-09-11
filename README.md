@@ -9,11 +9,14 @@ The authoritative engineering contract is [`FORESIGHT_Build_Spec.md`](FORESIGHT_
 [`FORESIGHT_Final_Architecture.pdf`](FORESIGHT_Final_Architecture.pdf). Team work
 distribution: [`docs/FORESIGHT_Team_Work_Distribution.pdf`](docs/FORESIGHT_Team_Work_Distribution.pdf).
 
-**Status: Tier A complete, Tier B implemented** (I.5 heterogeneous ensemble,
-typed-event attack-path engine, identity adapter + evidence requests, paired
-range-action trials). The pipeline runs end-to-end on disclosed synthetic
-captures. No real-network measured performance is claimed; accuracy claims
-require the evaluation gates in Build Spec Section 29.
+**Status: Tier A + Tier B complete, real-data (CTU-13) integration included.**
+I.5 heterogeneous ensemble, typed-event attack-path engine, identity adapter +
+evidence requests, paired range-action trials, and a qualified CTU-13
+real-flow transfer profile (ADR-003). The synthetic pipeline runs end-to-end
+on disclosed synthetic captures; the CTU-13 profile runs on real
+capture-derived flows under disclosed flow-only limitations. Accuracy claims
+are bounded by the evaluation gates in Build Spec Section 29 and are reported
+per profile — synthetic evidence and real-flow evidence are never mixed.
 
 ## Repository layout
 
@@ -61,37 +64,70 @@ docs/adr/           ADR-001 model defaults, ADR-002 Tier B defaults
 ## Quick start
 
 Python 3.10 with PyTorch (CUDA), PyTorch Geometric, NumPy, PyYAML; the console
-needs Node for building.
+needs Node for building. Run everything with the Python 3.10 interpreter.
 
 ```
-# 1. train the Section-35 profile: 5 reference seeds + 2 gate + 2 wide
-#    I.5 heterogeneous members (synthetic corpus, ~1-2 h on an RTX 4060;
-#    per-epoch checkpointed, safe to re-run and resume)
+# 0. qualify registered real datasets (Section 6) — CTU-13 scenarios 1/6/12
+python -m foresight.cli data qualify --manifest configs/datasets/ctu13.json
+
+# 1. train the Section-35 profile: reference seeds 0-2, gate seeds 0-1,
+#    wide seed 0 — six heterogeneous I.5 members on the 300-episode corpus
+#    (~4-6 h on an RTX 4060 laptop; per-epoch checkpointed, safe to re-run
+#    and resume; stale checkpoints are fingerprint-rejected automatically)
 python scripts/train_profile.py
 
-# 2. train the Tier B next-mark path decoder over the chain labels (N.2)
-python scripts/train_paths.py
-
-# 3. produce the locked-test evaluation report (M.1-M.5)
+# 2. locked-test evaluation of the synthetic profile (M.1-M.5)
 python scripts/evaluate_profile.py
 
-# 4. build the console (once)
+# 3. train the Tier B next-mark path decoder over the chain labels (N.2)
+python scripts/train_paths.py
+
+# 4. fine-tune + evaluate the CTU-13 real-flow transfer profile (ADR-003;
+#    runs only after step 1 — it binds the synthetic profile's manifest hash)
+python scripts/train_ctu_profile.py
+
+# 5. build the console (once)
 cd apps/console && npm install && npm run build && cd ../..
 
-# 5. serve API + console
+# 6. serve API + console
 python scripts/serve_console.py        # http://127.0.0.1:8001
 ```
 
 Without step 1 the console falls back to untrained reference weights with an
 explicit disclosure on every screen — interface semantics, not performance.
-Without step 2 the Paths screen reports `not_supported` (typed paths are a
-separate model; the Tier A candidate-edge projection still renders). With
-both, nine independently trained heterogeneous members (reference/gate/wide
-× seeds) run the full pipeline: packet telemetry → eligibility-gated
-windows → the 44/11/24 feature registry → calibrated cumulative-risk
-forecasts with conditional ETAs, sealed records with publication receipts,
-SENTINEL novelty, deletion-tested evidence, typed attack-path hypotheses,
-allowlisted evidence requests and paired range-action trials.
+Without step 3 the Paths screen reports `not_supported` (typed paths are a
+separate model; the Tier A candidate-edge projection still renders). Without
+step 4 the two real-capture catalog entries are listed as unavailable.
+
+## Command surface (L.4)
+
+```
+python -m foresight.cli doctor                      # deps, hashes, golden fixture
+python -m foresight.cli data qualify --manifest …   # verify a dataset registry
+python -m foresight.cli train / evaluate            # Section-35 pipeline
+python -m foresight.cli bundle verify --bundle …    # hash-verified bundle load
+python -m foresight.cli replay predict --episode campaign:index
+python -m foresight.cli replay verify --receipt …   # E.2/E.3 receipt check
+python -m foresight.cli release verify --manifest configs/release.json
+python -m foresight.cli serve
+```
+
+Exit codes: 0 success, 2 invalid input, 3 missing dependency, 4 failed gate,
+5 inconclusive evaluation. The remaining proposed L.4 pipeline-step commands
+(`data extract/split`, `features build`, `labels build`, `baseline train`) are
+provided by the scripts and library modules above; `baseline` runs inside
+`evaluate` (M.2).
+
+## Real data (CTU-13)
+
+`configs/datasets/ctu13.json` is the qualified registry: scenario 1 trains,
+scenario 6 calibrates, scenario 12 is the locked test; the split unit is the
+whole scenario (M.1). The profile is a flow-only transfer (ADR-003): packet
+features carry validity false, `Background` is never benign, only
+`From-Normal` is a verified negative, and only task 0 plus explicitly
+CC/C&C-labeled task 3 are supported. The public scenario-6 PCAP is botnet-only
+and is disclosed as such — it is a parser/ingestion demonstration, not a
+mixed-capture claim.
 
 ## What the demo shows
 
@@ -126,6 +162,32 @@ The corpus is synthetic and disclosed as such. Unsupported targets return
 alert. Novelty is unexpectedness, not an attack probability. Deltas from
 deletion are sensitivity, not causal effects. Statistical gates on the
 synthetic corpus are evidence about the corpus, not real-world performance.
+The CTU-13 profile adds real-flow evidence under its own disclosed limits
+(flow-only features, scenario-level splits, botnet-only public PCAP); its
+gates are reported independently and may be inconclusive where the public
+labels provide no forecastable onset.
+
+## Release notes (T.3)
+
+Supported per profile (authoritative source: the `evaluation_report.json`
+inside each verified bundle — `foresight release verify` checks them):
+
+- **Synthetic profile** (`artifacts/profile`): 300-episode disclosed corpus,
+  six heterogeneous members. Supported targets/horizons, gates and metrics:
+  see the bundle's evaluation report.
+- **CTU-13 transfer profile** (`artifacts/ctu13/profile`, optional): tasks 0
+  and CC-labeled task 3 only; scenario-split evidence; packet features
+  unsupported (validity false); background excluded from benign.
+- Known blind spots: tasks without fitted calibrators abstain honestly;
+  alert thresholds are fitted on small calibration splits and generalize
+  imperfectly (documented per report); the paired range is synthetic and its
+  attacker has no backup channel (Tier C).
+- Required sensors: full-packet PCAP or the synthetic generator for the core
+  profile; binetflow flows for the CTU profile.
+- Disabled extensions: actions are unavailable on fixed real captures;
+  endpoint/identity telemetry is synthetic-only; Tier C research items
+  (active sensing, causal action models, adaptive attackers, controlled
+  learning) remain out of scope.
 
 ## Environment
 

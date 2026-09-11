@@ -156,9 +156,10 @@ def beam_search(
             for log_p, opt_idx in zip(top.values.tolist(), top.indices.tolist()):
                 new_log = beam["log_prob"] + log_p
                 if opt_idx == stop_idx:
-                    result.paths.append(
-                        PathHypothesis(beam["marks"], new_log, "stop")
-                    )
+                    if step > 0:
+                        result.paths.append(
+                            PathHypothesis(beam["marks"], new_log, "stop")
+                        )
                 elif opt_idx == outside_idx:
                     hyp = PathHypothesis(beam["marks"], new_log, "outside")
                     result.outside_paths.append(hyp)

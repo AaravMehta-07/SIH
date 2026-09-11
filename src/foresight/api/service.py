@@ -52,6 +52,17 @@ _NS = 1_000_000_000
 WINDOW_NS = 30 * _NS
 HORIZON_BINS = 60
 
+#: Stable identity of the Section-7 eligibility rule bound into every
+#: legal-prefix hash (the rule itself lives in SecurityEvent.eligible_at).
+ELIGIBILITY_RULE_ID = (
+    "eligible(v,d)=event_time_upper<=d&available_at<=d&ingested_at<=d"
+    "&provenance_verified@foresight.core.2026-09"
+)
+
+_DATASET_REGISTRY = {
+    "ctu13": "configs/datasets/ctu13.json",
+}
+
 #: Curated demo catalog: one episode per family with analyst-facing titles.
 CATALOG: tuple[dict, ...] = (
     {
@@ -138,14 +149,109 @@ class EpisodeSession:
             self.record_ids = {}
         if not self.created_at:
             self.created_at = time.time()
+        self._capture_hash_value: str | None = None
+        self._registry_hash_value: str | None = None
         # Tier B identity modality: a separate replay-only telemetry stream
         # (Section 21). Generated deterministically, parsed by the real
         # adapter boundary, never read by the forecasting pipeline.
-        if self.query_engine is None:
+        if self.query_engine is None and self.episode.capture.synthetic:
             records = generate_identity_log(self.episode)
             parsed = IdentityAdapter().parse(identity_log_csv(records))
             self.identity_quality = parsed.quality_report
             self.query_engine = QueryEngine(parsed.records)
+        elif self.query_engine is None:
+            self.identity_quality = {
+                "adapter": "not_supported",
+                "total_rows": 0,
+                "parsed_rows": 0,
+                "malformed_rows": 0,
+                "coverage": {"covered_hosts": [], "note": "CTU-13 has no endpoint identity log"},
+            }
+            self.query_engine = QueryEngine([])
+
+    # ------------------------------------------------------------------
+    def _capture_hash(self) -> str:
+        """sha256 over the session's source packet table (the immutable
+        source object every legal prefix derives from; deterministic per
+        episode)."""
+        import hashlib
+
+        if self._capture_hash_value is None:
+            capture = self.episode.capture
+            h = hashlib.sha256()
+            h.update(self.episode.episode_id.encode("utf-8"))
+            h.update(str(capture.seed).encode("ascii"))
+            h.update(capture.packets.tobytes())
+            self._capture_hash_value = h.hexdigest()
+        return self._capture_hash_value
+
+    def _dataset_registry_hash(self) -> str | None:
+        """sha256 of the qualified dataset registry when this session runs
+        on a registered real dataset (CTU-13), else None."""
+        import hashlib
+
+        if self._registry_hash_value is None:
+            campaign = self.episode.campaign
+            registry_name = next(
+                (k for k in _DATASET_REGISTRY if campaign.startswith(k)), None
+            )
+            if registry_name is None:
+                return None
+            path = (
+                Path(__file__).resolve().parents[3]
+                / _DATASET_REGISTRY[registry_name]
+            )
+            if not path.exists():
+                return None
+            self._registry_hash_value = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+        return self._registry_hash_value
+
+    def _provenance(self, cutoff_window: int, result) -> dict:
+        """Section-7/T.4 seal inputs bound into every committed forecast:
+        legal-prefix hash, source-object hashes, verified artifact hashes
+        (scaler/config/policy/models), runtime profile and the computations
+        the engine itself omits."""
+        import hashlib
+
+        cutoff_ns = cutoff_window * WINDOW_NS
+        prefix_hash = hashlib.sha256(
+            f"{self._capture_hash()}|{cutoff_ns}|{ELIGIBILITY_RULE_ID}".encode(
+                "ascii"
+            )
+        ).hexdigest()
+        registry = self._dataset_registry_hash()
+        source_objects = {"capture": self._capture_hash()}
+        if registry:
+            source_objects["dataset_registry"] = registry
+        bundle = self.bundle
+        return {
+            "legal_prefix_hash": prefix_hash,
+            "eligibility_rule_id": ELIGIBILITY_RULE_ID,
+            "source_object_hashes": source_objects,
+            "artifact_hashes": {
+                "manifest": bundle.artifact_hashes.get("manifest.json"),
+                "scaler": bundle.artifact_hashes.get("scaler.json"),
+                "calibrators": bundle.artifact_hashes.get("calibrators.json"),
+                "selection_policy": bundle.artifact_hashes.get(
+                    "selection_policy.json"
+                ),
+                "task_manifest": bundle.artifact_hashes.get(
+                    "task_manifest.json"
+                ),
+                "config": bundle.config_hash,
+                "models": dict(bundle.model_hashes),
+            },
+            "policy_context": {
+                "selection_policy_hash": bundle.artifact_hashes.get(
+                    "selection_policy.json"
+                ),
+                "alert_budget_per_100_asset_hours": 1.0,
+            },
+            "runtime_profile": bundle.weights_profile,
+            "omitted_computations": list(result.omitted),
+        }
 
     @property
     def identity_log_csv_text(self) -> str:
@@ -188,7 +294,10 @@ class EpisodeSession:
         request = ForecastRequest(
             horizon_bins=HORIZON_BINS,
             bin_seconds=30,
-            task_mask=torch.ones(5, dtype=torch.bool),
+            task_mask=torch.tensor(
+                [i in self.episode.qualified_tasks for i in range(5)],
+                dtype=torch.bool,
+            ),
             min_occurrence_probability=0.30,
             published_horizons_seconds=(300, 900, 1800),
             candidate_pairs=example.candidate_pairs,
@@ -200,6 +309,7 @@ class EpisodeSession:
         payload = self._forecast_payload(
             example, result, cutoff_window, compute_seconds
         )
+        provenance = self._provenance(cutoff_window, result)
 
         # Commit the immutable record, then publish (E.2/E.3).
         record = {
@@ -211,6 +321,7 @@ class EpisodeSession:
             "decision_cutoff_ns": str(cutoff_window * WINDOW_NS),
             "session_cutoff_window": cutoff_window,
             "model": payload["model"],
+            "provenance": provenance,
             "targets": [
                 {
                     "entity_id": e["name"],
@@ -226,7 +337,7 @@ class EpisodeSession:
                 for t in e["tasks"]
             ],
             "runtime_health": payload["coverage"]["health"],
-            "synthetic": True,
+            "synthetic": bool(self.episode.capture.synthetic),
         }
         forecast_hash = self.storage.commit_forecast(record)
         published_at = self.storage.publish_forecast(record["id"])
@@ -236,6 +347,7 @@ class EpisodeSession:
             "committed": True,
             "published_at_ns": str(published_at),
             "compute_to_ledger_seconds": round(compute_seconds, 3),
+            "provenance": provenance,
         }
         self.record_ids[cutoff_window] = record["id"]
         self.forecast_cache[cutoff_window] = payload
@@ -335,6 +447,7 @@ class EpisodeSession:
                     "tactic_tags": [
                         {"tactic": SIH_TACTICS[i], "probability": round(float(p), 4)}
                         for i, p in enumerate(tactic_probs)
+                        if i in self.episode.qualified_tactics
                     ],
                 }
             )
@@ -376,6 +489,7 @@ class EpisodeSession:
                 "observed_hosts": len(self.entity_ids),
             },
             "paths": paths_payload,
+            "data_disclosure": self.episode.capture.source_disclosure,
         }
 
     def _paths_payload(self, example, result, cutoff_window: int) -> dict:
@@ -403,6 +517,12 @@ class EpisodeSession:
             ),
         }
         engine = self.bundle.path_engine
+        if not self.episode.capture.synthetic:
+            payload["note"] = (
+                "not_supported: the synthetic path decoder is not qualified "
+                "for CTU-13 labels; marginal candidate edges remain separate"
+            )
+            return payload
         if engine is None:
             return payload
         with torch.no_grad():
@@ -502,7 +622,8 @@ class EpisodeSession:
         for r in rows:
             s = names[int(table["src"][r])]
             d = names[int(table["dst"][r])]
-            s_int, d_int = is_internal(s), is_internal(d)
+            roles = {h.name: h.role for h in self.episode.capture.hosts}
+            s_int, d_int = roles[s] != "external", roles[d] != "external"
             if s_int == d_int:
                 continue  # only cross-boundary pairs matter here
             key = (s, d)

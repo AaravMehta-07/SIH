@@ -138,6 +138,17 @@ def test_expired_never_executes() -> None:
         machine.authorize(sign_approval(proposal))
 
 
+def test_policy_failures_cannot_be_authorized() -> None:
+    proposal = _proposal()
+    machine = ActionStateMachine(
+        proposal,
+        now_ns=1_000_000_000_000,
+        policy_failures=["pair outside allowlist"],
+    )
+    with pytest.raises(IllegalTransitionError, match="policy failures"):
+        machine.authorize(sign_approval(proposal))
+
+
 def test_audit_log_records_transitions() -> None:
     proposal = _proposal()
     machine = ActionStateMachine(proposal, now_ns=1_000_000_000_000)
@@ -197,6 +208,8 @@ def test_paired_trial_averts_downstream_lateral(c2_episode) -> None:
     assert ("ws-41.corp.local", "file-01.corp.local") in averted_pairs
     action_sources = {e["source"] for e in payload["action_arm"]["events"]}
     assert "ws-41.corp.local" not in action_sources
+    if any(e["source"] == "file-01.corp.local" for e in payload["no_action"]["events"]):
+        assert "file-01.corp.local" not in action_sources
     # the block bit something
     assert payload["action_arm"]["packets_blocked"] > 0
 

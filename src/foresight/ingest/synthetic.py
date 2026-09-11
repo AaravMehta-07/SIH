@@ -411,6 +411,10 @@ class SyntheticCapture:
     family: str
     seed: int
     synthetic: bool = True
+    capabilities: frozenset[str] | None = None
+    capability_report: object | None = None
+    quality_report: object | None = None
+    source_disclosure: str = "synthetic packet telemetry"
 
     @property
     def host_names(self) -> tuple[str, ...]:

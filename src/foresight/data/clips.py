@@ -107,6 +107,7 @@ def precompute_episode(episode: Episode, *, stride: int = CUTOFF_STEP) -> Episod
                 sensor_gaps.setdefault(idx, []).append((f, t))
 
     table = capture.packets
+    capabilities = capture.capabilities
 
     # Full-information windows (label side; may see everything). The grid is
     # anchored at episode start: window i covers (i*30s, (i+1)*30s], so the
@@ -119,6 +120,7 @@ def precompute_episode(episode: Episode, *, stride: int = CUTOFF_STEP) -> Episod
         cutoff_ns=EPISODE_WINDOWS * WINDOW_NS,
         history_windows=EPISODE_WINDOWS,
         sensor_gap_hosts=sensor_gaps,
+        **({"capabilities": capabilities} if capabilities is not None else {}),
     )
 
     prefix: dict[int, list[RawGraphWindow]] = {}
@@ -132,6 +134,7 @@ def precompute_episode(episode: Episode, *, stride: int = CUTOFF_STEP) -> Episod
             cutoff_ns=cutoff_ns,
             history_windows=HISTORY_WINDOWS,
             sensor_gap_hosts=sensor_gaps,
+            **({"capabilities": capabilities} if capabilities is not None else {}),
         )
     return EpisodePrecomputed(
         episode_id=episode.episode_id,
@@ -199,6 +202,9 @@ def build_clip_example(
         scaler=scaler,
         split=split,
         followup_end_ns=episode.end_ns,
+        qualified_tasks=episode.qualified_tasks,
+        qualified_tactics=episode.qualified_tactics,
+        at_risk_entities_by_task=episode.at_risk_entities_by_task,
     )
     return ClipExample(
         episode_id=episode.episode_id,
@@ -236,8 +242,18 @@ class ClipDataset:
     def _cache_path(self, episode: Episode) -> Path | None:
         if self.cache_dir is None:
             return None
+        scaler_fingerprint = "unscaled"
+        if self.scaler is not None:
+            import json
+
+            scaler_fingerprint = hashlib.sha256(
+                json.dumps(self.scaler.to_json(), sort_keys=True).encode("utf-8")
+            ).hexdigest()[:16]
         digest = hashlib.sha256(
-            f"{episode.episode_id}:{episode.seed}:{self.split}:{self.horizon}".encode()
+            (
+                f"{episode.episode_id}:{episode.seed}:{self.split}:{self.horizon}:"
+                f"stride={self.stride or CUTOFF_STEP}:scaler={scaler_fingerprint}"
+            ).encode()
         ).hexdigest()[:16]
         return self.cache_dir / f"{episode.episode_id}-{digest}.pkl"
 
@@ -289,9 +305,12 @@ class ClipDataset:
         """Fit the F.8 scaler on this dataset's raw prefix windows (train
         split only; never per uploaded file)."""
         windows: list[RawGraphWindow] = []
+        active_stride = self.stride or CUTOFF_STEP
         for episode in self.episodes:
-            pre = precompute_episode(episode)
-            for cutoff in sample_cutoffs(episode, horizon=self.horizon):
+            pre = precompute_episode(episode, stride=active_stride)
+            for cutoff in sample_cutoffs(
+                episode, horizon=self.horizon, stride=active_stride
+            ):
                 windows.extend(pre.prefix_windows[cutoff])
         return fit_scaler(windows)
 
@@ -301,10 +320,7 @@ def episode_asset_table(episode: Episode) -> dict:
     observed internal host count and observed window span."""
     capture = episode.capture
     table = capture.packets
-    internal = [
-        i for i, h in enumerate(capture.hosts)
-        if h.name.endswith((".corp.local", ".dmz.local"))
-    ]
+    internal = [i for i, h in enumerate(capture.hosts) if h.role != "external"]
     observed = {
         capture.hosts[i].name
         for i in internal

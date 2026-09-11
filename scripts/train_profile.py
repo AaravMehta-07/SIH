@@ -2,10 +2,11 @@
 
 Pipeline (all offline, laptop GPU):
 
-1. Build the synthetic episode corpus (72 episodes, six families) and the
+1. Build the synthetic episode corpus (300 episodes, six families) and the
    M.1 chronological episode splits (60/15/10/15).
 2. Fit the F.8 feature scaler on the TRAIN split's prefix windows only.
-3. Train five independent members (seeds 0-4, I.5: separate encoders,
+3. Train six independent heterogeneous members (three reference, two gate,
+   one wide; I.5: separate encoders,
    transitions and heads) with the Section-15 objective, rollout curriculum
    [1,3,10,30,60] and effective batch 16 clips.
 4. Early-stop each member on development average precision at the primary
@@ -80,12 +81,11 @@ from foresight.training.targets import ClipTargets  # noqa: E402
 from foresight.training.trainer import CurriculumSchedule, Trainer, set_seed  # noqa: E402
 
 PRIMARY_HORIZON = 10
-SEEDS = (0, 1, 2, 3, 4)
 #: I.5 heterogeneous ensemble: the Tier B profile trains the Section-13
 #: reference plus two architecturally distinct members (models/variants.py).
-#: Reference checkpoints from the original 5-seed run are reused (same
-#: interface, same corpus); gate/wide are trained fresh.
-DEFAULT_MEMBERS = "reference:0,1,2,3,4 gate:0,1 wide:0,1"
+#: All members are retrained after corpus scaling.  Six preserves three
+#: architectures while bounding laptop wall-clock and memory (I.5/T.1).
+DEFAULT_MEMBERS = "reference:0,1,2 gate:0,1 wide:0"
 CURRICULUM_TRANSITIONS = (9, 17, 25, 33)  # epochs at which horizon advances
 EARLY_STOP_PATIENCE = 8
 #: Early stop may only fire once the curriculum reaches the PRIMARY horizon
@@ -272,7 +272,22 @@ def fit_selection_policy(
         asset_hours = sum(r["asset_hours_weight"] for r in records)
         events = [r for r in records if r["event"]]
         non_events = [r for r in records if not r["event"] and r["complete_followup"]]
-        thresholds = sorted({r["score"] for r in records}, reverse=True)
+        if not events:
+            policy[str(task)] = {
+                "threshold": None,
+                "status": "insufficient_positive_support",
+                "false_alerts_per_100_asset_hours": None,
+                "warned_events": 0,
+                "total_events": 0,
+            }
+            continue
+        # Alerts use score > threshold. Place candidates immediately below an
+        # observed score so equality does not make that operating point
+        # unreachable (I.3 deterministic threshold fitting).
+        thresholds = sorted(
+            {float(np.nextafter(r["score"], -np.inf)) for r in records},
+            reverse=True,
+        )
         best = None
         for thr in thresholds:
             false_alerts = sum(1 for r in non_events if r["score"] > thr)
@@ -459,14 +474,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, default=REPO_ROOT / "artifacts" / "profile")
     parser.add_argument("--cache", type=Path, default=REPO_ROOT / "artifacts" / "cache")
-    parser.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
     parser.add_argument(
         "--members",
         type=str,
         default=DEFAULT_MEMBERS,
         help=(
             "member plan: 'variant:seeds' groups, e.g. "
-            "'reference:0,1,2,3,4 gate:0,1 wide:0,1' (I.5)"
+            "'reference:0,1,2 gate:0,1 wide:0' (I.5)"
         ),
     )
     parser.add_argument("--epochs", type=int, default=40)
@@ -493,6 +507,12 @@ def main() -> None:
     print("[1/8] building corpus (synthetic, disclosed)...", flush=True)
     episodes = build_corpus()
     splits = split_episodes(episodes)
+    corpus_fingerprint = hashlib.sha256(
+        json.dumps(
+            [(e.episode_id, e.seed, e.family) for e in episodes],
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     print(
         f"  episodes: {len(episodes)} | train {len(splits.train)} "
         f"dev {len(splits.development)} cal {len(splits.calibration)} "
@@ -504,7 +524,19 @@ def main() -> None:
     print("[2/8] fitting F.8 scaler on train split...", flush=True)
     args.out.mkdir(parents=True, exist_ok=True)
     scaler_path = args.out / "scaler.json"
-    if scaler_path.exists():
+    scaler_meta_path = args.out / "scaler_corpus.json"
+    scaler_matches = False
+    if scaler_meta_path.exists():
+        try:
+            scaler_matches = (
+                json.loads(scaler_meta_path.read_text(encoding="utf-8")).get(
+                    "corpus_fingerprint"
+                )
+                == corpus_fingerprint
+            )
+        except (OSError, ValueError):
+            scaler_matches = False
+    if scaler_path.exists() and scaler_matches:
         # Fit once per corpus; per-seed invocations reuse the frozen fit
         # (F.8: never fit per run, let alone per upload).
         scaler = FeatureScaler.from_json(
@@ -519,6 +551,13 @@ def main() -> None:
         del train_ds
         gc.collect()
         scaler_path.write_text(scaler.serialize(), encoding="utf-8")
+        scaler_meta_path.write_text(
+            json.dumps(
+                {"corpus_fingerprint": corpus_fingerprint, "episodes": len(episodes)},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     # ---- 3. clip examples (staged for memory: train+dev now, cal/test later)
     print("[3/8] building clip examples (cached)...", flush=True)
@@ -558,7 +597,16 @@ def main() -> None:
         checkpoint = member_checkpoint(partial_dir, variant, seed)
         resume = None
         if checkpoint.exists():
-            resume = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            candidate = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            if candidate.get("corpus_fingerprint") == corpus_fingerprint:
+                resume = candidate
+            else:
+                print(
+                    f"[4/8] {member_key}: stale checkpoint ignored "
+                    "(corpus fingerprint changed)",
+                    flush=True,
+                )
+        if resume is not None:
             summary = resume["summary"]
             if resume.get("final", False):
                 members[(variant, seed)] = resume["state"]
@@ -719,6 +767,7 @@ def main() -> None:
                         "summary": run_summary_so_far(),
                         "epochs_no_improve": epochs_no_improve,
                         "final": False,
+                        "corpus_fingerprint": corpus_fingerprint,
                     },
                     checkpoint,
                 )
@@ -756,6 +805,7 @@ def main() -> None:
                 "state": best_state,
                 "summary": run_summaries[member_key],
                 "final": True,
+                "corpus_fingerprint": corpus_fingerprint,
             },
             member_checkpoint(partial_dir, variant, seed),
         )
@@ -801,19 +851,6 @@ def main() -> None:
     )
     engines: list[ForecastEngine] = []
     calibrators_payload: dict[str, dict] = {}
-    # Legacy calibrators from the reference-only profile are keyed
-    # "{seed}:{task}"; remap to the member-qualified form instead of
-    # refitting (same weights, same calibration split).
-    legacy_calibrators: dict[str, dict] = {}
-    legacy_path = args.out / "calibrators.json"
-    if legacy_path.exists():
-        try:
-            raw = json.loads(legacy_path.read_text(encoding="utf-8"))
-            legacy_calibrators = {
-                k: v for k, v in raw.items() if k.count(":") == 1
-            }
-        except (ValueError, OSError):
-            legacy_calibrators = {}
     for variant, seed in plan:
         model = build_world_model(config, variant=variant, num_event_tasks=5).to(
             device
@@ -832,10 +869,6 @@ def main() -> None:
     for mi, (variant, seed) in enumerate(plan):
         member_key = f"{variant}:{seed}"
         for task, (logits, events, masks) in member_logits[member_key].items():
-            legacy = legacy_calibrators.get(f"{seed}:{task}") if variant == "reference" else None
-            if legacy is not None:
-                calibrators_payload[f"{member_key}:{task}"] = legacy
-                continue
             cal = fit_hazard_calibrator(logits, events, masks, task_index=task)
             calibrators_payload[f"{member_key}:{task}"] = cal.to_dict()
             print(
@@ -935,6 +968,7 @@ def main() -> None:
                 "ensemble": "I.5 heterogeneous (reference + gate + wide)",
                 "corpus": {
                     "episodes": len(episodes),
+                    "fingerprint": corpus_fingerprint,
                     "splits": splits.manifest(),
                 },
                 "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

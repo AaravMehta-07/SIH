@@ -33,17 +33,29 @@ from ..actions import (
 )
 from ..contracts.objects import full_packet_capability
 from ..data.episodes import build_episode
+from ..data.ctu import build_ctu_episode, build_ctu_pcap_episode
+from ..ingest.ctu_adapter import parse_ctu_binetflow
+from ..ingest.pcap_adapter import parse_pcap
 from ..labels.ontology import SIH_TACTICS, TASK_DEFINITIONS
 from .bundle import RuntimeBundle, load_bundle
 from .service import CATALOG, EpisodeSession
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-PROFILE_DIR = REPO_ROOT / "artifacts" / "profile"
+#: The serving profile directory is overridable (FORESIGHT_PROFILE_DIR) so a
+#: verified snapshot bundle can be served while a retrain rebuilds the
+#: default location — the SE01 hash seal still applies to whatever loads.
+PROFILE_DIR = Path(
+    os.environ.get("FORESIGHT_PROFILE_DIR", REPO_ROOT / "artifacts" / "profile")
+)
+CTU_PROFILE_DIR = REPO_ROOT / "artifacts" / "ctu13" / "profile"
 RUNTIME_STORE = REPO_ROOT / "artifacts" / "runtime-store"
 
 _bundle: RuntimeBundle | None = None
+_ctu_bundle: RuntimeBundle | None = None
 _sessions: dict[str, EpisodeSession] = {}
 _episode_cache: dict[tuple[str, int], object] = {}
+MAX_SESSIONS = 32
+MAX_ACTIONS = 256
 
 
 def get_bundle() -> RuntimeBundle:
@@ -51,6 +63,21 @@ def get_bundle() -> RuntimeBundle:
     if _bundle is None:
         _bundle = load_bundle(PROFILE_DIR, config_path=REPO_ROOT / "configs" / "core.yaml")
     return _bundle
+
+
+def get_ctu_bundle() -> RuntimeBundle:
+    """Load the separately calibrated CTU profile; never silently fake it."""
+
+    global _ctu_bundle
+    if _ctu_bundle is None:
+        if not (CTU_PROFILE_DIR / "manifest.json").exists():
+            raise RuntimeError(
+                "CTU profile is unavailable; run scripts/train_ctu_profile.py"
+            )
+        _ctu_bundle = load_bundle(
+            CTU_PROFILE_DIR, config_path=REPO_ROOT / "configs" / "core.yaml"
+        )
+    return _ctu_bundle
 
 
 def _storage():
@@ -120,7 +147,7 @@ async def unhandled_error(request: Request, exc: Exception):
         request,
         500,
         "internal_error",
-        f"{type(exc).__name__}: {exc}",
+        "internal service error",
         retryable=True,
     )
 
@@ -175,6 +202,41 @@ def catalog() -> dict:
                 "source_format": "synthetic packet telemetry (disclosed)",
             }
         )
+    ctu_path = REPO_ROOT / "artifacts" / "ctu13" / "raw" / "ctu13-scenario-06.binetflow"
+    items.append(
+        {
+            "catalog_id": "ctu13-06-real",
+            "campaign": "ctu13-scenario-06",
+            "title": "CTU-13 scenario 6 real flow replay",
+            "summary": (
+                "Real labeled bidirectional network flows. Packet-only features are "
+                "unavailable; Background remains separate from verified Normal."
+            ),
+            "family": "ctu13-real-flow",
+            "synthetic": False,
+            "available": ctu_path.exists() and (CTU_PROFILE_DIR / "manifest.json").exists(),
+            "source_format": "CTU-13 binetflow (real capture-derived flows)",
+        }
+    )
+    pcap_path = REPO_ROOT / "artifacts" / "ctu13" / "raw" / "ctu13-scenario-06-botnet-only.pcap"
+    items.append(
+        {
+            "catalog_id": "ctu13-06-pcap-real",
+            "campaign": "ctu13-scenario-06-pcap",
+            "title": "CTU-13 scenario 6 packet replay",
+            "summary": (
+                "Real public botnet-only PCAP. Packet-header features are observed; "
+                "flow features are derived by bounded segmentation."
+            ),
+            "family": "ctu13-real-pcap",
+            "synthetic": False,
+            "available": (
+                pcap_path.exists() and ctu_path.exists()
+                and (CTU_PROFILE_DIR / "manifest.json").exists()
+            ),
+            "source_format": "CTU-13 PCAP (real, botnet-only scope)",
+        }
+    )
     return {
         "catalog": items,
         "weights_profile": bundle.weights_profile,
@@ -209,6 +271,34 @@ def task_manifest() -> dict:
 # ---------------------------------------------------------------------------
 
 def _build_catalog_episode(catalog_id: str):
+    if catalog_id == "ctu13-06-pcap-real":
+        flow_path = REPO_ROOT / "artifacts" / "ctu13" / "raw" / "ctu13-scenario-06.binetflow"
+        pcap_path = REPO_ROOT / "artifacts" / "ctu13" / "raw" / "ctu13-scenario-06-botnet-only.pcap"
+        if not flow_path.exists() or not pcap_path.exists():
+            raise FileNotFoundError("qualified CTU-13 scenario 6 flow/PCAP files are not installed")
+        key = (catalog_id, 0)
+        if key not in _episode_cache:
+            parsed = parse_ctu_binetflow(flow_path, scenario_id="06")
+            packets = parse_pcap(pcap_path)
+            _episode_cache[key] = build_ctu_pcap_episode(
+                packets, parsed, partition=1, slice_index=0
+            )
+        return _episode_cache[key], {
+            "title": "CTU-13 scenario 6 packet replay",
+            "summary": "Real botnet-only packet capture with explicit scope limitations.",
+        }
+    if catalog_id == "ctu13-06-real":
+        path = REPO_ROOT / "artifacts" / "ctu13" / "raw" / "ctu13-scenario-06.binetflow"
+        if not path.exists():
+            raise FileNotFoundError("qualified CTU-13 scenario 6 file is not installed")
+        key = (catalog_id, 0)
+        if key not in _episode_cache:
+            parsed = parse_ctu_binetflow(path, scenario_id="06")
+            _episode_cache[key] = build_ctu_episode(parsed, partition=1, slice_index=0)
+        return _episode_cache[key], {
+            "title": "CTU-13 scenario 6 real flow replay",
+            "summary": "Real capture-derived flows with an explicit degraded capability profile.",
+        }
     index = int(catalog_id.split("-")[1])
     entry = CATALOG[index]
     key = (entry["campaign"], entry["index"])
@@ -219,9 +309,11 @@ def _build_catalog_episode(catalog_id: str):
 
 @app.post("/v1/sessions", status_code=201)
 def create_session(body: CreateSession) -> dict:
+    if len(_sessions) >= MAX_SESSIONS:
+        raise HTTPException(429, f"session quota reached ({MAX_SESSIONS})")
     try:
         episode, entry = _build_catalog_episode(body.catalog_id)
-    except (IndexError, ValueError):
+    except (IndexError, ValueError, FileNotFoundError):
         raise HTTPException(404, f"unknown catalog_id {body.catalog_id!r}") from None
     bundle = get_bundle()
     session = EpisodeSession(
@@ -259,7 +351,7 @@ def _session_summary(session: EpisodeSession, entry: dict | None = None) -> dict
         "cutoff_window": max(session.valid_cutoffs()),
         "valid_cutoffs": session.valid_cutoffs(),
         "entity_count": len(session.entity_ids),
-        "synthetic": True,
+        "synthetic": bool(episode.capture.synthetic),
         "weights_profile": session.bundle.weights_profile,
     }
 
@@ -278,16 +370,37 @@ def session_detail(session_id: str) -> dict:
         {
             "history_windows": 20,
             "parse_status": "qualified",
-            "packet_count": int(len(capture.packets)),
+            "observation_count": int(len(capture.packets)),
+            "observation_unit": (
+                "packet" if capture.family == "ctu13-real-pcap" else
+                "flow" if capture.family == "ctu13-real-flow" else "packet"
+            ),
             "capabilities": {
                 "node_input": 88,
                 "edge_input": 22,
                 "global_input": 48,
-                "flow_and_packet_features": True,
+                "flow_features": (
+                    capture.capabilities is None
+                    or "flow_lifecycle" in capture.capabilities
+                ),
+                "packet_features": (
+                    capture.capabilities is None
+                    or "packet_timing" in capture.capabilities
+                ),
                 "encrypted_payload_visible": False,
                 "offline": True,
             },
-            "capability_report": full_packet_capability().to_json(),
+            "capability_report": (
+                capture.capability_report.to_json()
+                if capture.capability_report is not None
+                else full_packet_capability().to_json()
+            ),
+            "quality_report": (
+                capture.quality_report.to_json()
+                if capture.quality_report is not None
+                else None
+            ),
+            "data_disclosure": capture.source_disclosure,
             "observation_gaps": [
                 {"host": h, "from_ns": str(f), "to_ns": str(t)}
                 for h, f, t in capture.sensor_gaps
@@ -430,9 +543,20 @@ def query_execute(proposal_id: str, body: QueryExecuteBody) -> dict:
     expired — never an invented observation (N.3)."""
     session = _session_or_404(body.session_id)
     try:
-        return session.execute_query(proposal_id, body.cutoff_window)
+        answer = session.execute_query(proposal_id, body.cutoff_window)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
+    _audit_event(
+        "query_executed",
+        {
+            "proposal_id": proposal_id,
+            "entity": answer.get("entity"),
+            "status": answer.get("status"),
+            "cutoff_window": body.cutoff_window,
+            "forecast_version": answer.get("forecast_version"),
+        },
+    )
+    return answer
 
 
 # -- actions (synthetic range only, disclosed) ------------------------------
@@ -455,12 +579,32 @@ class ActionExecuteBody(BaseModel):
 _actions: dict[str, "ActionStateMachine"] = {}
 
 
+def _audit_event(kind: str, payload: dict) -> None:
+    """Durable audit record (Section 23 audit integrity). The audit sink
+    must never break the action/query planes — on storage failure the
+    in-memory trail remains the primary record for the offline demo."""
+    try:
+        storage = _storage()
+        try:
+            storage.meta.audit("local", kind, payload)
+        finally:
+            storage.close()
+    except Exception:  # noqa: BLE001 - audit is best-effort durable
+        pass
+
+
 @app.get("/v1/actions")
 def actions_status() -> dict:
     """Action plane status + reconciler pass (Section 23: TTL and recovery
     enforced even if the planner or UI crashed)."""
     for machine in _actions.values():
+        before = machine.status
         machine.reconcile()
+        if machine.status != before:
+            _audit_event(
+                "action_transition",
+                {"event": machine.status, "action_id": machine.proposal.action_id},
+            )
     return {
         "mode": "demo_range",
         "disclosure": (
@@ -479,6 +623,14 @@ def actions_propose(body: ActionProposeBody) -> dict:
     from ..actions import new_proposal, check_policy
 
     session = _session_or_404(body.session_id)
+    if not session.episode.capture.synthetic:
+        raise HTTPException(
+            409,
+            "actions are not supported for fixed real captures; the paired "
+            "causal range is synthetic and separately disclosed",
+        )
+    if len(_actions) >= MAX_ACTIONS:
+        raise HTTPException(429, f"action quota reached ({MAX_ACTIONS})")
     payload = session.forecast_cache.get(body.cutoff_window)
     if payload is None:
         raise HTTPException(
@@ -527,6 +679,20 @@ def actions_propose(body: ActionProposeBody) -> dict:
     )
     machine = ActionStateMachine(proposal, policy_failures=failures)
     _actions[proposal.action_id] = machine
+    _audit_event(
+        "action_transition",
+        {
+            "event": "proposed",
+            "action_id": proposal.action_id,
+            "status": machine.status,
+            "action_type": proposal.action_type,
+            "parameters": {"source": proposal.source, "target": proposal.target},
+            "forecast_hash": proposal.forecast_hash,
+            "cutoff_window": proposal.cutoff_window,
+            "policy_version": proposal.policy_version,
+            "policy_failures": failures,
+        },
+    )
     return machine.to_json()
 
 
@@ -545,6 +711,15 @@ def actions_authorize(action_id: str, body: ActionAuthorizeBody) -> dict:
         machine.authorize(signature)
     except IllegalTransitionError as exc:
         raise HTTPException(409, str(exc)) from None
+    _audit_event(
+        "action_transition",
+        {
+            "event": "authorized",
+            "action_id": machine.proposal.action_id,
+            "status": machine.status,
+            "idempotency_key": machine.proposal.idempotency_key,
+        },
+    )
     return machine.to_json()
 
 
@@ -583,6 +758,21 @@ def actions_execute(action_id: str, body: ActionExecuteBody) -> dict:
     machine.complete(status, outcome)
     result = machine.to_json()
     result["trial"] = outcome
+    _audit_event(
+        "action_transition",
+        {
+            "event": status,
+            "action_id": proposal.action_id,
+            "status": machine.status,
+            "dry_run": body.dry_run,
+            "postcondition_verified": trial.postcondition_verified,
+            "averted_events": len(trial.averted_events),
+            "packets_blocked": trial.action_arm.packets_blocked,
+            "benign_packet_loss_pct": trial.service_disruption[
+                "benign_packet_loss_pct"
+            ],
+        },
+    )
     return result
 
 

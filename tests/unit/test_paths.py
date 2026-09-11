@@ -209,3 +209,4 @@ def test_benign_episode_still_searches(benign_episode) -> None:
     payload = forecast.to_json()
     assert payload["no_event_mass"] >= 0.0
     assert payload["candidate_pairs"]["pair_count"] > 0
+    assert abs(payload["mass_accounting_total"] - 1.0) <= 1e-5

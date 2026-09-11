@@ -90,6 +90,24 @@ class TestWindowGrid:
         bounds = window_bounds(60 * S, 2)
         assert bounds == [(0, 30 * S), (30 * S, 60 * S)]
 
+    def test_flow_segment_reopens_after_active_timeout(self):
+        table = finalize_table([
+            packet(t * S, A, B, sport=40000, dport=443)
+            for t in (1, 20, 40, 60, 80, 100, 120, 122)
+        ])
+        windows = build_clip_windows(
+            table,
+            entity_ids=ENTITIES,
+            entity_of_host={A: 0, B: 1, C: 2},
+            internal_hosts={A, B, C},
+            cutoff_ns=150 * S,
+            history_windows=5,
+        )
+        assert windows[0].global_values[0] == 1
+        assert not windows[0].global_validity[0]
+        assert windows[4].global_values[0] == 1
+        assert windows[4].global_validity[0]
+
 
 class TestEligibility:
     """TM02: event before d but receipt after d is excluded."""

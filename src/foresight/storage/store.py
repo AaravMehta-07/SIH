@@ -145,22 +145,25 @@ class Storage:
         forecast_hash = sha256_hex(canonical_json(payload))
         stored = dict(record)
         stored["forecast_hash"] = forecast_hash
-        self.meta.execute(
-            "INSERT OR REPLACE INTO forecasts "
-            "(forecast_id, tenant_id, session_id, scope_id, decision_cutoff_ns, "
-            " forecast_hash, payload_json, committed_at_ns) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                record["id"],
-                record.get("tenant_id", self.tenant_id),
-                record.get("session_id"),
-                record.get("scope_id"),
-                str(record["decision_cutoff_ns"]),
-                forecast_hash,
-                canonical_json(stored),
-                str(time.time_ns()),
-            ),
-        )
+        try:
+            self.meta.execute(
+                "INSERT INTO forecasts "
+                "(forecast_id, tenant_id, session_id, scope_id, decision_cutoff_ns, "
+                " forecast_hash, payload_json, committed_at_ns) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record["id"],
+                    record.get("tenant_id", self.tenant_id),
+                    record.get("session_id"),
+                    record.get("scope_id"),
+                    str(record["decision_cutoff_ns"]),
+                    forecast_hash,
+                    canonical_json(stored),
+                    str(time.time_ns()),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise StoreError(f"forecast id is immutable: {record['id']}") from exc
         return forecast_hash
 
     def get_forecast(self, forecast_id: str, tenant_id: str | None = None):

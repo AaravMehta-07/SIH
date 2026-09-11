@@ -23,8 +23,6 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..data.episodes import is_internal
-
 _NS = 1_000_000_000
 WINDOW_NS = 30 * _NS
 
@@ -72,7 +70,7 @@ def build_node_names(entity_ids: tuple[str, ...], capture) -> tuple[str, ...]:
     """Path vocabulary: internal scope slots first, then external hosts in
     stable capture order (internal slots index the world-state entity memory;
     externals use a learned bucket embedding)."""
-    externals = [h.name for h in capture.hosts if not is_internal(h.name)]
+    externals = [h.name for h in capture.hosts if h.role == "external"]
     return tuple(entity_ids) + tuple(externals)
 
 
@@ -164,8 +162,9 @@ def build_candidate_set(
     table = episode.capture.packets
     names = [h.name for h in episode.capture.hosts]
     node_names = build_node_names(episode.internal_entity_ids(), episode.capture)
+    roles = {h.name: h.role for h in episode.capture.hosts}
     internal_count = len(node_names) - len(
-        [h for h in episode.capture.hosts if not is_internal(h.name)]
+        [h for h in episode.capture.hosts if h.role == "external"]
     )
 
     mask = _eligible_prefix(table, cutoff_ns)
@@ -181,8 +180,8 @@ def build_candidate_set(
             active.add(pair)
 
     def kind(pair: tuple[str, str]) -> str:
-        s_ext = not is_internal(pair[0])
-        t_ext = not is_internal(pair[1])
+        s_ext = roles[pair[0]] == "external"
+        t_ext = roles[pair[1]] == "external"
         if pair in active:
             return "external_active" if (s_ext or t_ext) else "active"
         if pair in seen:

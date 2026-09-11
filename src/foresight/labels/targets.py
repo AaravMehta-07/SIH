@@ -62,6 +62,8 @@ def build_clip_targets(
     future_windows: list[RawGraphWindow] | None = None,
     scaler: FeatureScaler | None = None,
     qualified_tasks: tuple[int, ...] = (0, 1, 2, 3, 4),
+    qualified_tactics: tuple[int, ...] = (0, 1, 2, 3, 4),
+    at_risk_entities_by_task: dict[int, frozenset[str]] | None = None,
     split: str = "train",
     followup_end_ns: int | None = None,
 ) -> ClipTargets:
@@ -94,6 +96,13 @@ def build_clip_targets(
             if not task_mask[t]:
                 continue  # unsupported dims stay masked (D.6)
             event_time = first_event.get((slot, t))
+            if (
+                event_time is None
+                and at_risk_entities_by_task is not None
+                and entity_ids[slot] not in at_risk_entities_by_task.get(t, frozenset())
+            ):
+                # Background/unattributed outcomes are unknown, not benign.
+                continue
             if event_time is not None:
                 b = _bin_of(event_time, cutoff_ns, horizon)
                 if b is None:
@@ -116,7 +125,9 @@ def build_clip_targets(
 
     # Stage labels: tactic activity windows projected onto future bins.
     stage_labels = torch.zeros(n, horizon, 5)
-    stage_mask = torch.ones(n, horizon, 5, dtype=torch.bool)
+    stage_mask = torch.zeros(n, horizon, 5, dtype=torch.bool)
+    for tactic in qualified_tactics:
+        stage_mask[:, :, tactic] = True
     for entity, tactic_idx, from_ns, to_ns in stage_windows:
         if entity not in slot_of:
             continue

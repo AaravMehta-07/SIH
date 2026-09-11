@@ -1,0 +1,78 @@
+{
+  "schema_version": "foresight.dataset-registry.v1",
+  "dataset_id": "ctu-13-selected-v1",
+  "title": "CTU-13 selected scenario profile",
+  "retrieved_at_utc": "2026-09-11T00:00:00Z",
+  "publisher": "Stratosphere IPS / Malware Capture Facility Project, Czech Technical University in Prague",
+  "dataset_page": "https://www.stratosphereips.org/datasets-ctu13",
+  "permission_and_attribution": {
+    "terms": "The official MCFP scenario pages permit free use of the malware captures provided the authors and MCFP are credited and cited.",
+    "required_citation": "Sebastian Garcia, Martin Grill, Jan Stiborek, Alejandro Zunino. An empirical comparison of botnet detection methods. Computers & Security 45 (2014), 100-123.",
+    "notice": "This registry records the publisher's dataset-page terms; it is not a legal re-licensing of the captures."
+  },
+  "qualification": {
+    "capture_topology": "Mixed normal, background, and botnet bidirectional flow exports from controlled CTU botnet scenarios; the public scenario PCAP files contain botnet traffic only, not the complete mixed capture.",
+    "source_timezone": "Europe/Prague",
+    "clock_uncertainty": "StartTime has second precision. Dur defines a flow activity interval. CTU publishes no independent collector availability or local-ingestion clock; replay assigns both to flow closure and records that assumption.",
+    "packet_completeness": "The selected binetflow files contain flow records only. Packet timing, packet flags, packet sizes, TTL, TCP sequence/window, fragmentation, and retransmission fields are not observed and their validity bits remain false.",
+    "endpoint_linkage": "IPv4 strings are observed addresses only. The adapter creates address-scoped entities and does not assert stable physical-device identity.",
+    "label_provenance": "Publisher-provided per-flow labels. Only From-Normal is a verified benign negative. Background is a separate unknown class and is never converted to benign. From-Botnet is a weak malicious-endpoint-contact proxy; only labels explicitly containing CC, C&C, IRC, or command-and-control support the C2 task.",
+    "unsupported_targets": ["initial-access", "lateral-movement", "exfiltration"],
+    "unsupported_tactics": ["reconnaissance", "initial-access", "lateral-movement", "command-and-control", "exfiltration"]
+  },
+  "split_policy": {
+    "unit": "scenario",
+    "train": ["CTU-13-1"],
+    "development": [],
+    "calibration": ["CTU-13-6"],
+    "locked_test": ["CTU-13-12"],
+    "locked_test_frozen_before_first_evaluation": true,
+    "note": "No window from a scenario crosses partitions. With only three selected campaigns there is no independent development partition; adaptation uses fixed ADR-003 defaults and evidence is downgraded where event support is insufficient."
+  },
+  "files": [
+    {
+      "scenario_id": "CTU-13-1",
+      "role": "train",
+      "kind": "binetflow",
+      "url": "https://mcfp.felk.cvut.cz/publicDatasets/CTU-Malware-Capture-Botnet-42/detailed-bidirectional-flow-labels/capture20110810.binetflow",
+      "local_artifact": "artifacts/ctu13/raw/ctu13-scenario-01.binetflow",
+      "size_bytes": 386629271,
+      "sha256": "be09f7f6a06beef0134152dc88bff85f0027db4affe07b3fbe956bbb49be5430",
+      "malware": "Neris",
+      "published_duration": "6.15 hours"
+    },
+    {
+      "scenario_id": "CTU-13-6",
+      "role": "calibration",
+      "kind": "binetflow",
+      "url": "https://mcfp.felk.cvut.cz/publicDatasets/CTU-Malware-Capture-Botnet-47/detailed-bidirectional-flow-labels/capture20110816.binetflow",
+      "local_artifact": "artifacts/ctu13/raw/ctu13-scenario-06.binetflow",
+      "size_bytes": 76780048,
+      "sha256": "801800eeda9a5a44868b1e3e492f93dc6d52b5d14566c1d8431c9e85d0d2adaa",
+      "malware": "DonBot",
+      "published_duration": "2 hours 9 minutes"
+    },
+    {
+      "scenario_id": "CTU-13-6",
+      "role": "demo-observation-only",
+      "kind": "pcap-botnet-only",
+      "url": "https://mcfp.felk.cvut.cz/publicDatasets/CTU-Malware-Capture-Botnet-47/botnet-capture-20110816-donbot.pcap",
+      "local_artifact": "artifacts/ctu13/raw/ctu13-scenario-06-botnet-only.pcap",
+      "size_bytes": 5284095,
+      "sha256": "28b49ca3e483a37c445474451b0cbe71cfa5a366cab67371031782b7a628d580",
+      "malware": "DonBot",
+      "published_capture_scope": "botnet traffic only"
+    },
+    {
+      "scenario_id": "CTU-13-12",
+      "role": "locked-test",
+      "kind": "binetflow",
+      "url": "https://mcfp.felk.cvut.cz/publicDatasets/CTU-Malware-Capture-Botnet-53/detailed-bidirectional-flow-labels/capture20110819.binetflow",
+      "local_artifact": "artifacts/ctu13/raw/ctu13-scenario-12.binetflow",
+      "size_bytes": 44718958,
+      "sha256": "1098f0addacedc321c7baefad63ef0d9a0f26630d0155087d37e8da770dd9f2e",
+      "malware": "NSIS.ay",
+      "published_duration": "1 hour 43 minutes"
+    }
+  ]
+}

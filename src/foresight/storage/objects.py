@@ -31,12 +31,25 @@ class ObjectStore:
     def _resolve_safe(self, key: str) -> Path:
         if not key.startswith("objects/"):
             raise StoreError(f"object keys must start with objects/: {key!r}")
-        path = (self.root / key).resolve()
-        if not str(path).startswith(str(self.root)):
+        parts = key.split("/")
+        if len(parts) != 3 or any(part in ("", ".", "..") for part in parts):
+            raise StoreError(f"invalid object key shape: {key!r}")
+        unresolved = self.root / key
+        for candidate in (unresolved, *unresolved.parents):
+            if candidate == self.root.parent:
+                break
+            if candidate.exists():
+                attrs = getattr(candidate.lstat(), "st_file_attributes", 0)
+                if candidate.is_symlink() or attrs & 0x400:
+                    raise StoreError(f"reparse-point path refused: {key!r}")
+        path = unresolved.resolve()
+        if not path.is_relative_to(self.root):
             raise StoreError(f"path escape refused: {key!r}")
         digest = key.rsplit("/", 1)[-1]
         if len(digest) != 64 or not set(digest) <= _NS_SAFE:
             raise StoreError(f"invalid object digest in key: {key!r}")
+        if parts[1] != digest[:2]:
+            raise StoreError(f"object prefix does not match digest: {key!r}")
         return path
 
     def put(self, content: bytes) -> tuple[str, str]:

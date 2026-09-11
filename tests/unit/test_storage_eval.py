@@ -32,11 +32,20 @@ from foresight.identity.resolver import AddressResolver, IdentityAmbiguity
 from foresight.sentinel.scorer import MaturedResidual, SentinelScorer
 from foresight.sentinel.reference import NoveltyReference, FEATURE_GROUPS
 from foresight.storage.store import Storage
+from foresight.storage.objects import StoreError
+from foresight.storage.objects import ObjectStore
 
 import numpy as np
 
 
 class TestStorage:
+    def test_object_key_traversal_and_prefix_confusion_rejected(self, tmp_path: Path):
+        store = ObjectStore(tmp_path / "objects-root")
+        digest = "a" * 64
+        for key in (f"objects/../{digest}", f"objects/bb/{digest}"):
+            with pytest.raises(StoreError):
+                store.get(key)
+
     def test_commit_verify_publish_roundtrip(self, tmp_path: Path):
         storage = Storage(tmp_path / "store")
         record = {
@@ -63,6 +72,9 @@ class TestStorage:
         second = storage.publish_forecast("fc-test-1")
         assert first == second
         assert storage.publication_receipt("fc-test-1") == first
+
+        with pytest.raises(StoreError, match="immutable"):
+            storage.commit_forecast({**record, "targets": [{"entity_id": "changed"}]})
 
     def test_tenant_isolation(self, tmp_path: Path):
         storage = Storage(tmp_path / "store")

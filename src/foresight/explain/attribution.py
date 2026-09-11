@@ -141,6 +141,11 @@ def _build_perturbed(
         filtered = table[keep]
     else:
         filtered = table
+    capability_args = (
+        {"capabilities": episode.capture.capabilities}
+        if episode.capture.capabilities is not None
+        else {}
+    )
     raw = build_clip_windows(
         filtered,
         entity_ids=pre.entity_ids,
@@ -149,6 +154,7 @@ def _build_perturbed(
         cutoff_ns=cutoff_window * WINDOW_NS,
         history_windows=HISTORY_WINDOWS,
         sensor_gap_hosts=pre.sensor_gaps,
+        **capability_args,
     )
     return collate_windows(raw, scaler)
 
@@ -212,8 +218,14 @@ def explain_target(
         start_ns = (w - 1) * WINDOW_NS
         end_ns = w * WINDOW_NS
         table = episode.capture.packets
+        eligible = (
+            (table["t_ns"] <= cutoff_window * WINDOW_NS)
+            & (table["available_ns"] <= cutoff_window * WINDOW_NS)
+            & (table["ingested_ns"] <= cutoff_window * WINDOW_NS)
+        )
         rows = np.where(
             ((table["t_ns"] > start_ns) & (table["t_ns"] <= end_ns))
+            & eligible
             & ((table["src"] == host_index) | (table["dst"] == host_index))
         )[0]
         if len(rows) == 0:
@@ -257,6 +269,11 @@ def explain_target(
             s, e_ = (w - 1) * WINDOW_NS, w * WINDOW_NS
             in_w = (table["t_ns"] > s) & (table["t_ns"] <= e_)
             keep &= ~(in_w & involves_all)
+        capability_args = (
+            {"capabilities": episode.capture.capabilities}
+            if episode.capture.capabilities is not None
+            else {}
+        )
         raw = build_clip_windows(
             table[keep],
             entity_ids=pre.entity_ids,
@@ -265,6 +282,7 @@ def explain_target(
             cutoff_ns=cutoff_window * WINDOW_NS,
             history_windows=HISTORY_WINDOWS,
             sensor_gap_hosts=pre.sensor_gaps,
+            **capability_args,
         )
         risk_wo = _risk_of(
             engine, request, collate_windows(raw, scaler),
@@ -288,6 +306,7 @@ def explain_target(
             cutoff_ns=cutoff_window * WINDOW_NS,
             history_windows=HISTORY_WINDOWS,
             sensor_gap_hosts=pre.sensor_gaps,
+            **capability_args,
         )
         risk_only = _risk_of(
             engine, request, collate_windows(raw, scaler),
@@ -316,6 +335,7 @@ def explain_target(
                 cutoff_ns=cutoff_window * WINDOW_NS,
                 history_windows=HISTORY_WINDOWS,
                 sensor_gap_hosts=pre.sensor_gaps,
+                **capability_args,
             )
             controls.append(
                 _risk_of(

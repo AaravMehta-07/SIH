@@ -201,6 +201,10 @@ class ActionStateMachine:
             raise IllegalTransitionError(
                 f"cannot authorize from {self.status}"
             )
+        if self.policy_failures:
+            raise IllegalTransitionError(
+                "policy failures block authorization: " + "; ".join(self.policy_failures)
+            )
         if not verify_approval(self.proposal, signature):
             raise IllegalTransitionError("approval signature mismatch")
         if self._now() > self.proposal.expiry_ns:
@@ -271,7 +275,11 @@ class ActionStateMachine:
         # gates its panels on ``authorizable``, which must survive the
         # authorize/execute responses unchanged.
         payload["policy_failures"] = list(self.policy_failures)
-        payload["authorizable"] = not self.policy_failures
+        payload["authorizable"] = (
+            self.status == "proposed"
+            and not self.policy_failures
+            and self._now() <= self.proposal.expiry_ns
+        )
         return payload
 
 

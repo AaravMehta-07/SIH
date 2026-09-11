@@ -388,15 +388,15 @@ CAMPAIGNS: dict[str, callable] = {
     "cred-spray": (campaign_cred_spray, "cred-spray"),
 }
 
-#: Corpus composition (72 episodes). Benign families get extra weight so the
+#: Corpus composition (300 episodes). Benign families get extra weight so the
 #: false-alert metric has real negative exposure (Section 29).
 CORPUS_PLAN: tuple[tuple[str, int], ...] = (
-    ("benign-baseline", 16),
-    ("benign-drift", 10),
-    ("web-to-lateral", 14),
-    ("c2-exfil", 12),
-    ("slow-recon", 10),
-    ("cred-spray", 10),
+    ("benign-baseline", 70),
+    ("benign-drift", 50),
+    ("web-to-lateral", 45),
+    ("c2-exfil", 45),
+    ("slow-recon", 45),
+    ("cred-spray", 45),
 )
 
 
@@ -414,6 +414,9 @@ class Episode:
     end_ns: int
     duration_ns: int
     chain: tuple[ChainStep, ...] = ()
+    qualified_tasks: tuple[int, ...] = (0, 1, 2, 3, 4)
+    qualified_tactics: tuple[int, ...] = (0, 1, 2, 3, 4)
+    at_risk_entities_by_task: dict[int, frozenset[str]] | None = None
 
     @property
     def ground_truth(self) -> tuple[GroundTruth, ...]:
@@ -421,10 +424,10 @@ class Episode:
 
     def internal_entity_ids(self) -> tuple[str, ...]:
         """Stable ordered internal entity union (G.2: scope order, sorted)."""
-        return tuple(sorted(h.name for h in self.capture.hosts if is_internal(h.name)))
+        return tuple(sorted(h.name for h in self.capture.hosts if h.role != "external"))
 
     def external_hosts(self) -> tuple[str, ...]:
-        return tuple(h.name for h in self.capture.hosts if not is_internal(h.name))
+        return tuple(h.name for h in self.capture.hosts if h.role == "external")
 
 
 def build_episode(campaign: str, index: int, *, seed: int | None = None,

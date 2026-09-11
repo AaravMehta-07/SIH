@@ -9,6 +9,7 @@ results and structured errors.
 from __future__ import annotations
 
 import os
+import json
 
 os.environ.setdefault("FORESIGHT_CONSOLE_PORT", "8021")
 
@@ -86,6 +87,48 @@ def test_forecast_commits_and_publishes(client, lateral_session):
             cum = task["cumulative_risk"]
             assert all(b >= a - 1e-9 for a, b in zip(cum, cum[1:]))
             assert -1e-9 <= cum[-1] <= 1 + 1e-9
+
+
+def test_forecast_provenance_is_sealed(client, lateral_session):
+    """T.4/Section-7: every committed forecast binds its legal-prefix hash,
+    source-object hashes and verified artifact hashes."""
+    sid = lateral_session["session_id"]
+    cutoff_a = lateral_session["valid_cutoffs"][0]
+    cutoff_b = lateral_session["valid_cutoffs"][1]
+    a = client.post(
+        f"/v1/sessions/{sid}/forecast", json={"cutoff_window": cutoff_a}
+    ).json()
+    b = client.post(
+        f"/v1/sessions/{sid}/forecast", json={"cutoff_window": cutoff_b}
+    ).json()
+
+    def check(payload):
+        prov = payload["record"]["provenance"]
+        assert len(prov["legal_prefix_hash"]) == 64
+        assert "eligible" in prov["eligibility_rule_id"]
+        assert len(prov["source_object_hashes"]["capture"]) == 64
+        artifacts = prov["artifact_hashes"]
+        assert artifacts["scaler"] and artifacts["config"]
+        assert artifacts["selection_policy"]
+        assert all(len(h) == 64 for h in artifacts["models"].values())
+        assert artifacts["models"], "member weights hashes are cited"
+        assert prov["runtime_profile"]
+        assert prov["omitted_computations"], "engine omissions are disclosed"
+        return prov
+
+    prov_a = check(a)
+    prov_b = check(b)
+    # same source object and artifacts across cutoffs; the PREFIX hash
+    # differs because the eligibility window differs
+    assert (
+        prov_a["source_object_hashes"]["capture"]
+        == prov_b["source_object_hashes"]["capture"]
+    )
+    assert (
+        prov_a["artifact_hashes"]["models"]
+        == prov_b["artifact_hashes"]["models"]
+    )
+    assert prov_a["legal_prefix_hash"] != prov_b["legal_prefix_hash"]
 
 
 def test_forecast_unknown_session_404(client):
@@ -262,6 +305,51 @@ def test_actions_authorize_and_execute_paired_trial(client, lateral_session):
     assert again.status_code == 409
 
 
+def test_action_lifecycle_writes_durable_audit(
+    client, lateral_session, monkeypatch, tmp_path
+):
+    """Section 23 audit integrity: every action lifecycle transition and
+    query execution lands in the durable audit log, not only in memory."""
+    import sqlite3
+
+    monkeypatch.setattr(server, "RUNTIME_STORE", tmp_path)
+    sid = lateral_session["session_id"]
+    cutoff = lateral_session["valid_cutoffs"][5]
+    client.post(f"/v1/sessions/{sid}/forecast", json={"cutoff_window": cutoff})
+    proposal = client.post(
+        "/v1/actions/propose",
+        json={
+            "session_id": sid,
+            "cutoff_window": cutoff,
+            "source": "web-01.dmz.local",
+            "target": "ext-c2-01.net",
+        },
+    ).json()
+    assert proposal["authorizable"] is True
+    client.post(f"/v1/actions/{proposal['action_id']}/authorize", json={})
+    executed = client.post(
+        f"/v1/actions/{proposal['action_id']}/execute", json={"dry_run": True}
+    )
+    assert executed.status_code == 200, executed.text
+
+    conn = sqlite3.connect(tmp_path / "metadata.sqlite3")
+    try:
+        rows = conn.execute(
+            "SELECT kind, payload_json FROM audit_events ORDER BY at_ns"
+        ).fetchall()
+    finally:
+        conn.close()
+    kinds = [k for k, _ in rows]
+    assert kinds.count("action_transition") >= 3  # proposed, authorized, terminal
+    events = [json.loads(p) for _, p in rows]
+    assert any(e["event"] == "proposed" for e in events)
+    assert any(e["event"] == "authorized" for e in events)
+    assert any(
+        e["event"] in ("succeeded", "failed") and "postcondition_verified" in e
+        for e in events
+    )
+
+
 def test_evaluation_golden_example(client):
     body = client.get("/v1/evaluation").json()
     golden = body["golden_example_1"]
@@ -276,3 +364,44 @@ def test_forecast_determinism_same_cutoff(client, lateral_session):
     a = client.post(f"/v1/sessions/{sid}/forecast", json={"cutoff_window": cutoff}).json()
     b = client.post(f"/v1/sessions/{sid}/forecast", json={"cutoff_window": cutoff}).json()
     assert a["record"]["forecast_hash"] == b["record"]["forecast_hash"]
+
+
+def test_console_api_shapes_round_trip_real_server_payloads(client, lateral_session):
+    """UI01: JSON produced by the server contains every field consumed by
+    ``apps/console/src/types.ts`` for the main session/forecast/query path."""
+
+    sid = lateral_session["session_id"]
+    detail = json.loads(json.dumps(client.get(f"/v1/sessions/{sid}").json()))
+    for key, expected in {
+        "session_id": str,
+        "valid_cutoffs": list,
+        "synthetic": bool,
+        "capability_report": dict,
+        "capabilities": dict,
+        "observation_count": int,
+        "observation_unit": str,
+    }.items():
+        assert isinstance(detail[key], expected), key
+    assert all(
+        {"field_group", "state", "reason", "source_count"} <= set(field)
+        for field in detail["capability_report"]["fields"]
+    )
+
+    cutoff = detail["valid_cutoffs"][0]
+    forecast = json.loads(json.dumps(client.post(
+        f"/v1/sessions/{sid}/forecast", json={"cutoff_window": cutoff}
+    ).json()))
+    assert {
+        "weights_profile", "model", "horizon_bins", "bin_seconds", "entities",
+        "graph", "novelty", "flagged", "coverage", "paths", "record",
+    } <= set(forecast)
+    assert all(
+        {"task_index", "status", "cumulative_risk", "no_event_mass", "alerting", "trust"}
+        <= set(task)
+        for entity in forecast["entities"] for task in entity["tasks"]
+    )
+    queries = json.loads(json.dumps(client.post(
+        "/v1/queries", json={"session_id": sid, "cutoff_window": cutoff}
+    ).json()))
+    assert {"cutoff_window", "policy", "identity_quality", "proposals", "note"} <= set(queries)
+    assert isinstance(queries["identity_quality"]["coverage"]["covered_hosts"], list)

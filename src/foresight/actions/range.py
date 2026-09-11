@@ -149,18 +149,24 @@ def paired_trial(episode, cutoff_window: int, *, source: str, target: str) -> Ra
         and {s.source, s.target} == {source, target}
     }
     drop = on_pair & after
-    for step in episode.chain:
+    suppressed_steps: set[tuple[str, str, int]] = set()
+    disabled_sources = set(c2_lost)
+    for step in sorted(episode.chain, key=lambda item: item.time_ns):
         if step.time_ns <= action_time_ns:
             continue
-        if {step.source, step.target} == {source, target}:
-            continue  # already covered by the pair block
-        if step.source in c2_lost:
+        blocked_step = {step.source, step.target} == {source, target}
+        if blocked_step or step.source in disabled_sources:
+            suppressed_steps.add((step.source, step.target, step.time_ns))
             s_i, d_i = names.index(step.source), names.index(step.target)
             span = (
                 (table["t_ns"] >= step.time_ns)
                 & (table["t_ns"] <= step.time_ns + STEP_SPAN_NS)
             )
             drop |= span & (table["src"] == s_i) & (table["dst"] == d_i)
+            # A suppressed compromise/lateral step cannot create a source
+            # for later actions.  Propagate this through the scripted DAG.
+            if step.task_index in (1, 2):
+                disabled_sources.add(step.target)
 
     action_table = table[~drop]
 
@@ -185,14 +191,8 @@ def paired_trial(episode, cutoff_window: int, *, source: str, target: str) -> Ra
     blocked = int((drop).sum())
     a_events = []
     averted = []
-    suppressed_steps = {
-        (s.source, s.target)
-        for s in episode.chain
-        if s.time_ns > action_time_ns
-        and (s.source in c2_lost or {s.source, s.target} == {source, target})
-    }
     for ev in no_arm.events:
-        key = (ev["source"], ev["target"])
+        key = (ev["source"], ev["target"], int(ev["time_ns"]))
         if key in suppressed_steps:
             averted.append(ev)
         else:

@@ -144,6 +144,7 @@ class CapabilityReport:
 BASE_FIELD_GROUPS = (
     "packet_timing",
     "packet_lengths",
+    "packet_counts",
     "ip_addresses",
     "transport_ports",
     "tcp_flags",

@@ -59,10 +59,21 @@ class RuntimeBundle:
     novelty_note: str = "reference fitted on benign training clips"
     members: list[tuple[str, int]] = None  # I.5: [(variant, seed), ...]
     path_engine: PathEngine | None = None   # Tier B §20 when trained
+    #: SE01-verified artifact hashes (name -> sha256) from the bundle
+    #: manifest; forecast provenance cites these (T.4 traceability).
+    artifact_hashes: dict = None
+    #: sha256 of the frozen core configuration (configs/core.yaml).
+    config_hash: str = ""
+    #: member key -> sha256 of that member's weights file.
+    model_hashes: dict = None
 
     def __post_init__(self) -> None:
         if self.members is None:
             self.members = [("reference", s) for s in self.seeds]
+        if self.artifact_hashes is None:
+            self.artifact_hashes = {}
+        if self.model_hashes is None:
+            self.model_hashes = {}
 
     @property
     def params_per_member(self) -> int:
@@ -90,7 +101,7 @@ def load_bundle(
         "selection_policy.json", "task_manifest.json",
     ]
     if not root.is_dir() or not all((root / f).exists() for f in required):
-        return _untrained_fallback(root, config)
+        return _untrained_fallback(root, config, config_path)
 
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     hashes = json.loads(
@@ -139,6 +150,12 @@ def load_bundle(
 
         return load_file(str(path))
 
+    def _member_hash(variant: str, seed: int) -> str:
+        path = root / f"model_{variant}_seed{seed}.safetensors"
+        if not path.exists() and variant == "reference":
+            path = root / f"model_seed{seed}.safetensors"
+        return _sha256_file(path)
+
     def _member_calibrators(variant: str, seed: int) -> CalibratorSet:
         # member-qualified keys "{variant}:{seed}:{task}"; legacy reference
         # bundles use "{seed}:{task}".
@@ -182,9 +199,19 @@ def load_bundle(
     hetero = "+".join(
         f"{v}x{n}" for v, n in sorted(variant_counts.items())
     )
+    data_profile = (
+        "synthetic corpus, disclosed"
+        if manifest.get("synthetic_data_only")
+        else "qualified CTU-13 real-flow transfer profile, disclosed"
+    )
+    evidence_scope = (
+        "synthetic-corpus evidence only"
+        if manifest.get("synthetic_data_only")
+        else "CTU-13 scenario-split evidence only"
+    )
     profile = (
         f"Section-35 trained profile (I.5 heterogeneous ensemble: {hetero}, "
-        f"{'synthetic corpus, disclosed' if manifest.get('synthetic_data_only') else 'undisclosed data'}"
+        f"{data_profile}"
         f"; best epochs "
         + ", ".join(
             str(
@@ -196,7 +223,7 @@ def load_bundle(
             for v, s in members
         )
         + ") with I.4 natural-prevalence calibration - interface semantics "
-        "on synthetic data, not measured real-world performance"
+        f"with {evidence_scope}; not production performance"
     )
     return RuntimeBundle(
         root=root,
@@ -212,10 +239,23 @@ def load_bundle(
         weights_profile=profile,
         members=members,
         path_engine=load_path_engine(root.parents[1] / "artifacts" / "paths"),
+        artifact_hashes=dict(hashes),
+        config_hash=_config_hash(config_path, root),
+        model_hashes={
+            f"{v}:{s}": _member_hash(v, s) for v, s in members
+        },
     )
 
 
-def _untrained_fallback(root: Path, config) -> RuntimeBundle:
+def _config_hash(config_path: Path | None, root: Path) -> str:
+    """sha256 of the frozen configuration actually loaded (T.4)."""
+    import hashlib
+
+    path = config_path or (root.parents[1] / "configs" / "core.yaml")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _untrained_fallback(root: Path, config, config_path: Path | None = None) -> RuntimeBundle:
     engines = []
     for seed in (0, 1, 2):
         torch.manual_seed(seed)
@@ -250,6 +290,7 @@ def _untrained_fallback(root: Path, config) -> RuntimeBundle:
             "scripts/train_profile.py to produce the trained profile"
         ),
         novelty_note="novelty unavailable (no trained reference)",
+        config_hash=_config_hash(config_path, root),
     )
 
 

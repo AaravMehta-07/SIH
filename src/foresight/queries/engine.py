@@ -38,6 +38,7 @@ UNCERTAIN_RULE = {
 
 #: Lateral movement task index (credential use).
 LATERAL_TASK = 2
+MAX_QUERY_PROPOSALS = 128
 
 QUERY_TYPE = "identity_session_detail"
 EXPIRY_SECONDS = 300
@@ -157,6 +158,8 @@ class QueryEngine:
         for name, prob in lateral:
             if not (threshold < prob <= CAP):
                 continue
+            if len(self._proposals) >= MAX_QUERY_PROPOSALS:
+                break
             proposal = QueryProposal(
                 proposal_id=f"qp-{uuid.uuid4().hex[:12]}",
                 query_type=QUERY_TYPE,

@@ -48,13 +48,15 @@ DEFAULT_DISPLAY_ETA_THRESHOLD = 0.30
 TASK_SUPPORTED = "supported"
 TASK_NOT_SUPPORTED = "not_supported"
 
-#: Pipeline stages that later modules own (Section 26 steps 9-14).
+#: Engine-scope disclosure: these pipeline stages are owned by later modules
+#: and attach their own typed fields in the same request (Section 26 steps
+#: 9-14); the engine itself never fakes them.
 OMITTED_STAGES = (
-    "trust: TrustContract gating pending runtime trust module",
-    "novelty: SENTINEL novelty detection pending sentinel module",
-    "evidence: evidence assembly and hashing pending evidence module",
-    "ledger: compute ledger commit pending storage module",
-    "publish: publication pending api module",
+    "trust: TrustContract gating owned by the trust stage",
+    "novelty: SENTINEL novelty owned by the sentinel stage",
+    "evidence: evidence assembly and hashing owned by the evidence stage",
+    "ledger: compute ledger commit owned by the storage stage",
+    "publish: publication owned by the api stage",
 )
 
 

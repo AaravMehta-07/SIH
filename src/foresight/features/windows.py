@@ -42,6 +42,7 @@ FULL_PACKET_CAPABILITIES = frozenset(
     {
         "packet_timing",
         "packet_lengths",
+        "packet_counts",
         "ip_addresses",
         "transport_ports",
         "tcp_flags",
@@ -279,7 +280,8 @@ def build_clip_windows(
 
     gaps = sensor_gap_hosts or {}
     tracker = _AttemptTracker(timeout_ns=3 * _NS, coverage=coverage)
-    seen_keys: set[int] = set()             # clip-relative segment keys
+    segment_state: dict[tuple[int, int, int, int, int], tuple[int, int, int]] = {}
+    next_segment_id = [0]
     seen_pairs: set[tuple[int, int]] = set()  # past-only internal pair set
 
     windows: list[RawGraphWindow] = []
@@ -296,7 +298,8 @@ def build_clip_windows(
                 entity_of_host=entity_of_host,
                 internal_hosts=internal_hosts,
                 tracker=tracker,
-                seen_keys=seen_keys,
+                segment_state=segment_state,
+                next_segment_id=next_segment_id,
                 seen_pairs=seen_pairs,
                 sensor_gaps=gaps,
                 capabilities=capabilities,
@@ -318,7 +321,8 @@ def _build_one_window(
     entity_of_host: dict[int, int],
     internal_hosts: set[int],
     tracker: _AttemptTracker,
-    seen_keys: set,
+    segment_state: dict,
+    next_segment_id: list[int],
     seen_pairs: set,
     sensor_gaps: dict[int, list[tuple[int, int]]],
     capabilities: frozenset[str],
@@ -358,25 +362,42 @@ def _build_one_window(
             for pos in positions:
                 node_valid[:, pos] = False
 
-    # ---- segment keys active in this window (F.2: same key = one segment) --
+    # ---- F.2 directional flow segments: 30s idle / 120s active timeout ----
     if len(rows):
-        seg_keys = (
-            rows["src"].astype(np.int64) * (2**48)
-            + rows["dst"].astype(np.int64) * (2**32)
-            + np.where(rows["sport"] >= 0, rows["sport"], 0).astype(np.int64) * (2**16)
-            + np.where(rows["dport"] >= 0, rows["dport"], 0).astype(np.int64)
-            + rows["proto"].astype(np.int64) * (2**62)
-        )
-        uniq, inv = np.unique(seg_keys, return_inverse=True)
+        if "flow_lifecycle" in caps and "packet_timing" not in caps:
+            # A completed-flow adapter already defines one segment per row.
+            # Do not reinterpret flow closure timestamps as packet arrivals.
+            uniq = np.arange(len(rows), dtype=np.int64)
+            inv = uniq.copy()
+            flow_starts = len(rows)
+        else:
+            raw_segment_ids = np.zeros(len(rows), dtype=np.int64)
+            flow_starts = 0
+            for row_index, row in enumerate(rows):
+                key = (
+                    int(row["src"]), int(row["dst"]), int(row["sport"]),
+                    int(row["dport"]), int(row["proto"]),
+                )
+                at = int(row["t_ns"])
+                prior = segment_state.get(key)
+                if (
+                    prior is None
+                    or at - prior[1] > 30 * _NS
+                    or at - prior[0] > 120 * _NS
+                ):
+                    segment_id = next_segment_id[0]
+                    next_segment_id[0] += 1
+                    segment_state[key] = (at, at, segment_id)
+                    flow_starts += 1
+                else:
+                    segment_id = prior[2]
+                    segment_state[key] = (prior[0], at, segment_id)
+                raw_segment_ids[row_index] = segment_id
+            uniq, inv = np.unique(raw_segment_ids, return_inverse=True)
     else:
         uniq = np.zeros(0, dtype=np.int64)
         inv = np.zeros(0, dtype=np.int64)
-
-    flow_starts = 0
-    for key in uniq.tolist():
-        if key not in seen_keys:
-            seen_keys.add(key)
-            flow_starts += 1
+        flow_starts = 0
 
     # ---- features 1-9: flags and matured connection attempts ---------------
     tcp_out = rows["proto"] == PROTO_TCP if len(rows) else np.zeros(0, dtype=bool)
@@ -513,7 +534,7 @@ def _build_one_window(
                 node_values[slot, 20] = float(p.mean())
                 node_values[slot, 21] = _quantile(p, 0.95)
                 node_valid[slot, 16:18] = True
-                node_valid[slot, 20:22] = True
+                node_valid[slot, 20:22] = "packet_counts" in caps
                 if "packet_timing" in caps:
                     d = (seg_last[out_seg] - seg_first[out_seg]) / 1e9
                     ds = np.sort(d)
@@ -529,7 +550,7 @@ def _build_one_window(
                 node_values[slot, 22] = float(p.mean())
                 node_values[slot, 23] = _quantile(p, 0.95)
                 node_valid[slot, 18:20] = True
-                node_valid[slot, 22:24] = True
+                node_valid[slot, 22:24] = "packet_counts" in caps
 
         # 25: bidirectional byte ratio; healthy idle is a valid 1 (F.6 row 25)
         # External peers carry slots >= n: they contribute to the internal
@@ -661,9 +682,10 @@ def _build_one_window(
         edge_values[e, 9] = (uv - vu) / (uv + vu + 1)
         edge_values[e, 10] = 1.0 if reverse is not None else 0.0
         edge_valid[e, 0] = True
-        edge_valid[e, 1] = True
+        edge_valid[e, 1] = "packet_counts" in caps
         edge_valid[e, 2] = True
-        edge_valid[e, 6:11] = True
+        edge_valid[e, 6:9] = "packet_counts" in caps
+        edge_valid[e, 9:11] = True
         evidence.edge_groups[(u, v)] = rws
 
     # ---- globals (F.7, exactly 24) ------------------------------------------
@@ -671,7 +693,11 @@ def _build_one_window(
     gv = np.zeros(_N_GLOBAL, dtype=bool)
 
     g[0] = flow_starts
-    gv[0] = True
+    # The reset boundary has no pre-window segment state, so a tuple first
+    # seen there is not evidence that its segment actually started there.
+    gv[0] = w_index > 0 and (
+        "packet_timing" in caps or "flow_start_time" in caps
+    )
     if len(rows):
         active = np.unique(
             np.concatenate([src_slot[src_slot < n], dst_slot[dst_slot < n]])
@@ -718,7 +744,7 @@ def _build_one_window(
         g[11] = tcp_count / total
         g[12] = float((rows["proto"] == PROTO_UDP).sum()) / total
         g[13] = 1.0 - g[11] - g[12]
-        gv[11:14] = True
+        gv[11:14] = "packet_counts" in caps
 
         if ordered_pairs:
             pb = np.sort(np.array([pair_byte[p] for p in ordered_pairs], dtype=float))
@@ -732,7 +758,7 @@ def _build_one_window(
             g[19] = _quantile(pp, 0.50)
             g[20] = _quantile(pp, 0.95)
             g[21] = _quantile(pp, 0.99)
-            gv[18:22] = True
+            gv[18:22] = "packet_counts" in caps
 
     gap_hosts = sum(
         1

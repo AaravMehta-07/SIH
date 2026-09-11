@@ -8,9 +8,11 @@ the Tier B training runs. None is an empirical claim.
 
 ## 1. I.5 Heterogeneous Ensemble (`models/variants.py`)
 
-- Member plan: `reference:0-4 gate:0,1 wide:0,1` (9 members). Reference
-  checkpoints from the original 5-seed run are reused unchanged; only the
-  interface (H.1) and frozen §35 widths are shared across families.
+- Member plan after the 300-episode corpus scale: `reference:0-2 gate:0,1
+  wide:0` (6 members). Every member is retrained because the corpus
+  fingerprint changed; stale 72-episode checkpoints and scalers are rejected.
+  The plan retains three architecturally distinct families while bounding the
+  laptop wall-clock and memory budget (I.5, L.1, T.1).
 - `gate`: two-layer GAT 88→96 (6×16 concat) → 64 (8 averaged 64-wide
   heads); GRUCell-gated entity transition `next = GRU(proj(endpoint),
   current)`; 32-wide heads; direct LayerNorm global map.

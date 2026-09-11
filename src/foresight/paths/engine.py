@@ -44,12 +44,19 @@ class PathForecast:
     candidate_pairs: dict
 
     def to_json(self) -> dict:
+        total = (
+            sum(float(p.get("probability", 0.0)) for p in self.ranked_paths)
+            + self.no_event_mass
+            + self.outside_candidate_mass
+            + self.truncated_search_mass
+        )
         return {
             "status": "supported",
             "ranked_paths": self.ranked_paths,
             "no_event_mass": self.no_event_mass,
             "outside_candidate_mass": self.outside_candidate_mass,
             "truncated_search_mass": self.truncated_search_mass,
+            "mass_accounting_total": round(total, 6),
             "beam": {"width": self.beam_width, "depth": self.beam_depth},
             "candidate_pairs": self.candidate_pairs,
             "calibrated": False,
