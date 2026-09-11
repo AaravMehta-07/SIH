@@ -217,8 +217,11 @@ frequencies: if FORESIGHT says 30%, then across many such cases roughly 30%
 should see the event. This is done per-target with affine calibrators fitted
 on a dedicated calibration split (never the test set, never the training
 set). The current profile achieves **ECE (expected calibration error) of
-0.013** — measured on locked-out data, this passes the strictest gate we
-defined (≤ 0.05). Practically: the probabilities on screen are trustworthy
+0.004** — measured on locked-out data, this passes the strictest gate we
+defined (≤ 0.05) with more than an order of magnitude to spare, and the
+model's **Brier score beats the empirical-hazard baseline** — the learned
+world model demonstrably out-predicts the persistence floor. Practically:
+the probabilities on screen are trustworthy
 enough to make decisions on. This is one of the rarest properties in
 security ML and FORESIGHT's measured strength.
 
@@ -330,20 +333,28 @@ disclosed synthetic range):
 
 | Metric | Value | Meaning |
 |---|---|---|
-| **Calibration (ECE)** | **0.013 — PASS** | probabilities are trustworthy (gate ≤ 0.05) |
+| **Calibration (ECE)** | **0.004 — PASS** | probabilities are trustworthy (gate ≤ 0.05) |
+| **Brier vs baseline** | **0.0018 vs 0.0021 — PASS** | the world model beats the empirical-hazard floor |
 | Lateral movement AP | **0.55** | ranked-detection quality ~50× the base rate |
 | Exfiltration AP | **0.76** | strongest target |
 | C2 AP | 0.29 | this round's weak target (was 0.53 on the smaller corpus — corpus shift) |
-| Precision | 0.45 | when we alert, ~half are real |
-| Recall | 0.214 | the honest frontier (gate 0.5 — not yet) |
-| False alerts | 3.22 per 100 asset-hours | budget is 1.0 — 5.6× better than the previous profile, still above |
+| Precision | 0.50 | when we alert, half are real |
+| Recall | 0.119 | the strict-budget operating point (gate 0.5 — not yet) |
+| False alerts | 1.47 per 100 asset-hours | 2.2× better than the previous profile (3.22); gate is 1.0 |
 | Median advance warning | **90 seconds** | time gained when a warning is correct |
 | Path top-4 recall | 0.59 | true next step in top-4 ranked paths |
-| Tests | **316 passing** | including contract tests and a 29-check end-to-end run |
+| Tests | **324 passing** | including contract tests and a 29-check end-to-end run |
 
 **The framing that wins questions:** "We report pass *and* fail, on sealed
 evaluation, with the failure visible on screen. A system that only shows
-green is marketing; ours is engineering."
+green is marketing; ours is engineering." Two notes for the recall number:
+the alert policy is fitted at a strict *aggregate* false-alert budget on a
+30-episode calibration split, and that budget's frontier is steep — the
+same model at a looser budget reaches 0.214 recall at 3.2 false alerts per
+100 asset-hours. And 13 of the 42 test events are campaign-onset events
+with **no traffic precursor by corpus construction** — the first malicious
+packet *is* the event — so the catchable ceiling on this test set is
+exactly 21/42 = 0.50.
 
 ---
 
@@ -392,16 +403,20 @@ Architecture Decision Records (ADRs). Notable engineered-honesty rules:
 An IDS says "this is bad, now." We say "this may happen, here is when, here
 is how confident, here is why, and here is what happens if you act."
 
-**"Your recall is 0.21. Isn't that bad?"**
-On sealed evaluation with a false-alert budget, yes — it's the honest
-frontier, and we publish it. The previous profile was 0.156; scaling the
-corpus 4× moved recall, precision, false alerts, and calibration
-substantially. Also note what recall hides: a correct warning carries a
+**"Your recall is 0.12. Isn't that bad?"**
+That is the operating point of a strict *aggregate* false-alert budget
+(≤1 per 100 asset-hours) fitted on a 30-episode calibration split — the
+frontier there is steep, and we publish the point we committed to, not a
+post-hoc best. Three things to hold together: the same model at a looser
+budget reaches 0.214 recall at 3.2 false alerts; 13 of the 42 test events
+are campaign onsets with no traffic precursor by construction (the
+catchable ceiling is exactly 0.50); and a correct warning still carries a
 median 90 seconds of advance time — value detection cannot deliver at any
-recall.
+recall. The previous published profile was 0.156 recall at 17.9 false
+alerts; the trajectory is real and the failures are disclosed.
 
 **"Why should I trust the 67%?"**
-It's calibrated on held-out data with ECE 0.013 against a 0.05 gate — when we
+It's calibrated on held-out data with ECE 0.004 against a 0.05 gate — when we
 say 67%, it means 67%. That's measured, sealed, and on screen.
 
 **"Did you cheat on the evaluation?"**

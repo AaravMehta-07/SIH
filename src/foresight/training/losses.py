@@ -23,6 +23,7 @@ form of ``log(q)`` and ``log1p(-q)`` — so no probability clamping is needed.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -64,6 +65,7 @@ def masked_survival_nll(
     risk_mask: Tensor,
     *,
     positive_weight: float = 1.0,
+    task_positive_weights: Sequence[float] | None = None,
 ) -> tuple[Tensor, int]:
     """Censored-discrete-time survival NLL over valid risk bins.
 
@@ -75,6 +77,10 @@ def masked_survival_nll(
     and the shift is corrected downstream by the I.4 affine calibrator
     fitted on natural-prevalence calibration data (A12) — the run manifest
     records the weight.
+
+    ``task_positive_weights`` (length ``J``) is the per-task form: event bins
+    of task ``j`` get weight ``task_positive_weights[j]``. It takes precedence
+    over the scalar and is recorded the same way (A12).
     """
     if not (hazard_logits.shape == event_y.shape == risk_mask.shape):
         raise ContractError(
@@ -87,7 +93,19 @@ def masked_survival_nll(
     log_1mq = nn.functional.logsigmoid(-hazard_logits)   # log(1 - q)
     per_bin = event_y * log_q + (1.0 - event_y) * log_1mq
     n = _count(risk_mask)
-    if positive_weight != 1.0:
+    if task_positive_weights is not None:
+        w = torch.as_tensor(
+            task_positive_weights, dtype=event_y.dtype, device=event_y.device
+        )
+        if w.numel() != event_y.shape[-1]:
+            raise ContractError(
+                "task_positive_weights must match the task axis "
+                f"({w.numel()} != {event_y.shape[-1]})"
+            )
+        bin_weight = 1.0 + event_y * (w - 1.0)
+        weighted = mask * bin_weight
+        loss = -(weighted * per_bin).sum() / weighted.sum().clamp(min=1.0)
+    elif positive_weight != 1.0:
         bin_weight = 1.0 + event_y * (positive_weight - 1.0)
         weighted = mask * bin_weight
         loss = -(weighted * per_bin).sum() / weighted.sum().clamp(min=1.0)
@@ -276,6 +294,7 @@ def compute_clip_loss(
     weights: LossWeights,
     *,
     positive_weight: float = 1.0,
+    task_positive_weights: Sequence[float] | None = None,
 ) -> LossBreakdown:
     """Combined Section-15 objective for one clip's rollout.
 
@@ -283,7 +302,8 @@ def compute_clip_loss(
     rollouts train only on the bins they produce; Section 15 rollout curriculum).
     Unsupported tasks (``task_mask`` False) are masked from the losses (D.6).
     ``positive_weight`` up-weights observed-event bins in the survival term
-    (Section 15 imbalance correction; corrected by I.4 calibration).
+    (Section 15 imbalance correction; corrected by I.4 calibration);
+    ``task_positive_weights`` is its per-task form and takes precedence.
     """
     s = _stack_steps(outputs)
     H_roll = s["hazard_logits"].shape[0]
@@ -299,7 +319,9 @@ def compute_clip_loss(
     event_y = targets.event_y[:, :H_roll, :].to(hazard_logits.dtype)
     risk_mask = targets.risk_mask[:, :H_roll, :] & targets.task_mask
     survival, survival_n = masked_survival_nll(
-        hazard_logits, event_y, risk_mask, positive_weight=positive_weight
+        hazard_logits, event_y, risk_mask,
+        positive_weight=positive_weight,
+        task_positive_weights=task_positive_weights,
     )
     bin_summary = per_bin_survival_nll(hazard_logits, event_y, risk_mask)
 

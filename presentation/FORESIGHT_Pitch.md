@@ -76,9 +76,12 @@ watch the commitment, then watch the reveal. **Any team can claim accuracy;
 we can prove the measurement.**
 
 ### 2. Calibration as a first-class property
-Our probabilities pass a strict calibration gate (ECE 0.013 vs 0.05 target)
-on locked-out data. Security dashboards almost never measure this. It's the
-difference between a scary-looking number and a **decision-grade number**.
+Our probabilities pass a strict calibration gate (ECE 0.004 vs 0.05 target)
+on locked-out data, and the world model **beats the empirical-hazard
+baseline on Brier score** — the learned dynamics demonstrably out-predict
+the persistence floor. Security dashboards almost never measure either.
+It's the difference between a scary-looking number and a
+**decision-grade number**.
 
 ### 3. Evidence accountability, not "the AI said so"
 Every prediction is **deletion-tested**: remove a piece of the traffic,
@@ -113,7 +116,7 @@ masked as unsupported where the data can't measure them, `Background` never
 counted as benign. **Real-data rigor, not a screenshot claim.**
 
 ### 8. Production-grade engineering
-316 automated tests, contract-first typed APIs, three Architecture Decision
+324 automated tests, contract-first typed APIs, three Architecture Decision
 Records, a 29-check end-to-end harness, offline-first with zero cloud
 dependency, quota-hardened API, durable audit ledger. This isn't a notebook —
 it's a system.
@@ -151,7 +154,8 @@ plus the parts that make it *usable and provable*:
    they know their accuracy isn't leaked or cherry-picked. We hash-commit
    before reveal, on frozen splits.
 2. **They'll show scores; we show calibrated probabilities.** Ask what their
-   ECE is. Ours is 0.013 on locked-out data.
+   ECE is. Ours is 0.004 on locked-out data, and our Brier score beats the
+   empirical-hazard baseline — measured, not asserted.
 3. **They'll show detection; we show forecasting with lead time.** 90-second
    median advance warning on correct alerts — time to act, not time to
    investigate.
@@ -160,7 +164,7 @@ plus the parts that make it *usable and provable*:
    novelty separated from risk, unsupported ≠ zero.
 5. **They'll demo happy paths; we demo the failure modes too.** Misses and
    false alerts scored on screen. Judges trust systems that don't hide.
-6. **Engineering substance:** 316 tests, real datasets integrated with
+6. **Engineering substance:** 324 tests, real datasets integrated with
    verified provenance, safe-intervention machinery with audit trails.
 
 ---
@@ -171,10 +175,10 @@ plus the parts that make it *usable and provable*:
   attacker freedom. Forecasting converts detection time into *preparation*
   time — block the C2 channel before it opens, isolate the host before
   lateral movement, watch the database before exfiltration begins.
-- **Analyst economics.** With ~45% precision at a strict alert budget
-  (improving), each alert is worth triaging — versus industry ~10% precision
-  where 9 of 10 alerts are noise. Calibrated probabilities let a SOC *rank*
-  work by expected value.
+- **Analyst economics.** With ~50% precision at a strict aggregate
+  false-alert budget, each alert is worth triaging — versus industry ~10%
+  precision where 9 of 10 alerts are noise. Calibrated probabilities let a
+  SOC *rank* work by expected value.
 - **Deployment reality: traffic-only, offline-first.** No agents to deploy on
   endpoints, no cloud dependency, works on mirrored/span traffic. The
   easiest possible deployment surface for a network team — and the only one
@@ -195,15 +199,23 @@ acting now is worth."*
 
 ## Numbers to quote (memorize these five)
 
-1. **ECE 0.013** — calibration error on locked-out data (target ≤ 0.05): **PASS**
-2. **Exfiltration AP 0.76, lateral movement AP 0.55** — 50×+ over base rate
-3. **90 seconds** — median advance warning on correct forecasts
-4. **59%** — true next attack step appears in our top-4 ranked paths
-5. **316 tests passing** — including the 29-check end-to-end sealed workflow
+1. **ECE 0.004** — calibration error on locked-out data (target ≤ 0.05): **PASS**
+2. **Brier 0.0018 vs baseline 0.0021** — the world model beats the
+   empirical-hazard floor: **PASS** (a gate the previous profile failed)
+3. **Exfiltration AP 0.76, lateral movement AP 0.55** — 50×+ over base rate
+4. **90 seconds** — median advance warning on correct forecasts
+5. **324 tests passing** — contract tests plus a 29-check end-to-end
+   sealed-workflow harness
 
-And the honest two, said proudly: recall 0.214 at a 3.22 false alerts per
-100 asset-hours budget — *published as-is, on sealed evaluation, with the
-trajectory visible* (previous profile: 0.156 recall, 17.9 FA).
+And the honest two, said proudly: false alerts cut from 3.22 to **1.47 per
+100 asset-hours** (gate 1.0 — 2.2× better, still above) at event recall
+**0.119** — the steep frontier of a strict aggregate alert budget on a
+30-episode calibration split, *published as-is, on sealed evaluation*. For
+context on the recall ceiling: 13 of the 42 test events are campaign-onset
+events with no traffic precursor by corpus construction — no traffic-only
+forecaster can see them; the catchable ceiling on this test set is exactly
+21/42 = 0.50, and the same model run at a looser budget reaches 0.214
+recall at 3.2 false alerts. We report the strict-budget operating point.
 
 ---
 

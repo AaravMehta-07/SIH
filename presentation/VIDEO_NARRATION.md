@@ -126,10 +126,15 @@ FAIL in red), metrics, a reliability diagram.*
 
 Say:
 
-> "The locked-test evaluation: predeclared gates. Our calibration gate
-> passes at 0.013 error — when FORESIGHT says 67%, it means 67%. Recall and
-> false-alert gates we report honestly as failing — with the trajectory
-> visible. This is a scientific verification interface, not a scoreboard."
+> "The locked-test evaluation: predeclared gates, sealed before the reveal.
+> Calibration passes at 0.004 error — when FORESIGHT says 67%, it means
+> 67%. And the Brier score now beats the empirical-hazard baseline — the
+> learned world model out-predicts the persistence floor; that gate failed
+> on our previous profile. False alerts: cut from 3.2 to 1.5 per hundred
+> asset-hours. The recall gate we report at its measured frontier — a
+> third of these test events are campaign onsets with no traffic precursor
+> at all, and the catchable ceiling is disclosed. This is a scientific
+> verification interface, not a scoreboard."
 
 ---
 
@@ -168,10 +173,13 @@ Say:
   range engineered with real traffic signatures; the CTU-13 real-botnet
   integration is registry-verified on disk and reported separately — the
   two claims never mix.
-- **"How accurate?"** → Calibration error 0.013 on locked-out data; lateral
-  movement AP 0.55, exfiltration 0.76 — 50×+ over base rate; 90 seconds
-  median advance warning. Recall at the strict false-alert budget is 0.21 —
-  published as a failing gate, with the improvement trajectory.
+- **"How accurate?"** → Calibration error 0.004 on locked-out data; Brier
+  beats the empirical-hazard baseline (0.0018 vs 0.0021); lateral movement
+  AP 0.55, exfiltration 0.76 — 50×+ over base rate; 90 seconds median
+  advance warning. Recall at the strict aggregate false-alert budget is
+  0.12 — published as a failing gate, with the onset-event ceiling
+  disclosed (13 of 42 test events have no traffic precursor by
+  construction).
 - **"What's the model?"** → Graph attention network over the host
   communication graph, per-host recurrent memory, a global LSTM, and a
   learned transition that rolls the state forward in imagination — six

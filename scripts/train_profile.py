@@ -97,6 +97,45 @@ EARLY_STOP_PATIENCE = 8
 PRIMARY_HORIZON_EPOCH = 17
 FALSE_ALERT_BUDGET_PER_100_ASSET_HOURS = 1.0
 
+#: ---- v2 recall-focused fine-tune recipe (2026-09-12) ---------------------
+#: Locked-test diagnosis that motivated it (all from the sealed report):
+#:   (a) task-1 calibrators abstain (8 cal events < 20 minimum) so raw
+#:       ~0.99 logits pass through — 183 test records above 0.5 with 2 real
+#:       events, ~94% of the Brier gap;
+#:   (b) the v1 policy fitted each task at its OWN 1.0/100ah budget while
+#:       the Section-29 gate is AGGREGATE across tasks, and the fit only
+#:       counted at-risk records while the evaluator also counts post-event
+#:       re-alerts (an ongoing beacon keeps scores high after the event, and
+#:       each post-event re-alert can never match anything);
+#:   (c) catchable recall lives in tasks 2/3 (lateral, C2) — task 0 is the
+#:       campaign-onset event with no traffic precursor by construction.
+FINETUNE_RECIPE = "finetune-v3-recall"
+FINETUNE_EPOCHS = 14
+FINETUNE_LR = 1e-3
+#: Fine-tune curriculum starts AT the primary horizon (the members already
+#: learned h=1/3 in the scratch run) and still tours the long horizons so
+#: the transition model keeps its 30/60-bin quality. Every phase trains the
+#: primary bins too (the rollout covers bins 1..H).
+FINETUNE_HORIZONS = (10, 30, 60)
+FINETUNE_TRANSITIONS = (7, 11)
+#: v3 selection metric: fine-tuned members are selected on the mean dev AP
+#: over the CATCHABLE tasks (lateral/C2/exfil — the ones with traffic
+#: precursors). Onset tasks 0/1 have no precursor by corpus design; their
+#: dev AP is base-rate noise, and a 5-task mean dilutes exactly the ranking
+#: the recall gate measures. Dev-split selection only (I.1); the metric is
+#: recorded in every run summary.
+FINETUNE_SELECTION_TASKS = (2, 3, 4)
+#: Per-task survival positive weights (A12: recorded; the induced odds shift
+#: is corrected by the I.4 calibrators fitted at natural prevalence).
+#: Lateral/C2/exfil are the catchable tasks; onset tasks keep the base.
+TASK_POSITIVE_WEIGHTS = (50.0, 50.0, 100.0, 150.0, 100.0)
+BOOSTED_TASKS = (2, 3, 4)
+BOOSTED_POSITIVE_CLIP_OVERSAMPLING = 8.0
+#: Declared AGGREGATE alert budget for the v2 policy fit: 20% headroom under
+#: the Section-29 gate (1.0/100ah) for calibration->test split variance,
+#: declared before any test evaluation and recorded in the run manifest.
+POLICY_AGGREGATE_BUDGET = 0.8
+
 
 def parse_members(spec: str) -> list[tuple[str, int]]:
     """Parse a member plan like ``reference:0,1,2 gate:0,1 wide:0``."""
@@ -257,23 +296,160 @@ def dev_average_precision(
 
 def fit_selection_policy(
     cal_records: list[dict],
+    *,
+    budget: float = POLICY_AGGREGATE_BUDGET,
 ) -> dict:
-    """Per-task alert thresholds at the false-alert budget (calibration split).
+    """Per-task alert thresholds under an AGGREGATE false-alert budget,
+    fitted on the calibration split with the exact M.3 matching semantics.
 
-    ``cal_records`` entries: {task, score (F at primary horizon), event (bool),
-    complete_followup (bool), asset_hours_weight}. Alerts fire above the
-    threshold; false alerts count only with adequate follow-up (M.3).
+    ``cal_records`` entries: {task, entity, episode, cutoff_window, score,
+    event_bin, at_risk, event, complete_followup, asset_hours_weight}.
+    Records include post-event / not-at-risk forecasts: the evaluator alerts
+    on those too (an ongoing beacon keeps scores high after the event fired,
+    and each post-event re-alert after cooldown can never match anything),
+    so the fit must see them or it underestimates the false-alert rate.
+
+    The Section-29 gate is AGGREGATE false alerts per 100 asset-hours across
+    all tasks; this fit optimizes total warned events under that same
+    aggregate constraint. M.3 matching is per (entity, task) key, so the
+    per-task (matched, unmatched) frontiers are independent and the joint
+    optimum is a small knapsack over them. Alert semantics mirror the
+    evaluator exactly: alerts fire on score > threshold, sorted by emission,
+    300-second per-(entity, task) cooldown, strict-before-and-within-horizon
+    matching (I.3 deterministic threshold fitting).
     """
-    policy: dict[str, dict] = {}
-    by_task: dict[int, list[dict]] = {}
+    from foresight.evaluation.matching import (
+        Alert,
+        ObservedEvent,
+        match_events,
+    )
+
+    # Asset-hours mirror report.py: unique (episode, cutoff, entity) triples
+    # over the evaluated grid x primary horizon.
+    asset_hours = (
+        sum(
+            1
+            for _ in {
+                (r["episode"], r["cutoff_window"], r["entity"])
+                for r in cal_records
+            }
+        )
+        * PRIMARY_HORIZON
+        * 30
+        / 3600.0
+    )
+
+    # Events mirror the evaluator's extraction: unique first events per
+    # (episode, entity, task) from the records' event bins (absolute window).
+    first_event: dict[tuple[str, str, int], int] = {}
     for r in cal_records:
-        by_task.setdefault(r["task"], []).append(r)
-    for task, records in by_task.items():
-        asset_hours = sum(r["asset_hours_weight"] for r in records)
-        events = [r for r in records if r["event"]]
-        non_events = [r for r in records if not r["event"] and r["complete_followup"]]
-        if not events:
-            policy[str(task)] = {
+        if r.get("event_bin") is None:
+            continue
+        key = (r["episode"], r["entity"], r["task"])
+        w = r["cutoff_window"] + r["event_bin"]
+        if key not in first_event or w < first_event[key]:
+            first_event[key] = w
+
+    max_candidates = 4000
+    frontiers: dict[int, list[tuple[int, int, float]]] = {}
+    events_by_task: dict[int, list[ObservedEvent]] = {}
+    records_by_task: dict[int, list[dict]] = {}
+    for t in range(5):
+        records_by_task[t] = [r for r in cal_records if r["task"] == t]
+        events_by_task[t] = [
+            ObservedEvent(
+                entity=ent, task_index=t, event_window=w, episode_id=ep
+            )
+            for (ep, ent, tk), w in first_event.items()
+            if tk == t
+        ]
+        if not records_by_task[t]:
+            # No records -> the only operating point is abstention; the
+            # frontier must still carry it or the cross-task DP would drop
+            # accumulated choices when it reaches this task.
+            frontiers[t] = [(0, 0, float("inf"))]
+            events_by_task[t] = []
+            continue
+        scores = sorted({r["score"] for r in records_by_task[t]}, reverse=True)
+        if len(scores) > max_candidates:
+            # Evenly spaced subsample (densest at both ends); frontier
+            # windows can be a single score wide, so this cap is a last
+            # resort for pathologically large candidate sets.
+            keep = sorted(
+                set(
+                    int(round(f * (len(scores) - 1)))
+                    for f in np.linspace(0, 1, max_candidates)
+                )
+            )
+            cands = [scores[i] for i in keep]
+        else:
+            # Every unique score: the (matched, unmatched) frontier can
+            # change at any single score, so no coarser grid is safe.
+            cands = scores
+        thresholds = [float(np.nextafter(s, -np.inf)) for s in cands]
+        thresholds.append(float("inf"))  # abstain
+        frontier: dict[int, tuple[int, float]] = {}
+        for thr in thresholds:
+            alerts = [
+                Alert(
+                    entity=r["entity"],
+                    task_index=t,
+                    emission_window=r["cutoff_window"],
+                    score=r["score"],
+                    episode_id=r["episode"],
+                )
+                for r in records_by_task[t]
+                if r["score"] > thr
+            ]
+            alerts.sort(
+                key=lambda a: (a.emission_window, a.entity, a.task_index)
+            )
+            m = match_events(alerts, events_by_task[t])
+            u, mt = m.unmatched_alerts, m.matched_events
+            cur = frontier.get(u)
+            if cur is None or mt > cur[0] or (mt == cur[0] and thr > cur[1]):
+                frontier[u] = (mt, thr)
+        # Pareto frontier: (unmatched, matched, threshold), matched
+        # nondecreasing in unmatched, dominated points dropped.
+        pareto: list[tuple[int, int, float]] = []
+        best_m = -1
+        for u in sorted(frontier):
+            mt, thr = frontier[u]
+            if mt > best_m:
+                pareto.append((u, mt, thr))
+                best_m = mt
+        frontiers[t] = pareto
+
+    # Knapsack across tasks: maximize total matched subject to the
+    # aggregate false-alert budget (integer unmatched counts).
+    u_max = int(budget * asset_hours / 100.0)
+    dp: dict[int, tuple[int, dict[int, float]]] = {0: (0, {})}
+    for t in range(5):
+        ndp: dict[int, tuple[int, dict[int, float]]] = {}
+        for u0, (m0, ch0) in dp.items():
+            for u, mt, thr in frontiers[t]:
+                if u0 + u > u_max:
+                    continue
+                key = u0 + u
+                cand = (m0 + mt, {**ch0, t: thr})
+                cur = ndp.get(key)
+                if cur is None or cand[0] > cur[0]:
+                    ndp[key] = cand
+        dp = ndp if ndp else {0: (0, {})}
+    # Lowest unmatched total among the max-matched optima (deterministic).
+    best_choices: dict[int, float] = {}
+    best_matched = -1
+    for u_total in sorted(dp):
+        m_total, choices = dp[u_total]
+        if m_total > best_matched:
+            best_matched = m_total
+            best_choices = choices
+
+    policy: dict[str, dict] = {}
+    for t in range(5):
+        thr = best_choices.get(t, float("inf"))
+        if not events_by_task[t]:
+            policy[str(t)] = {
                 "threshold": None,
                 "status": "insufficient_positive_support",
                 "false_alerts_per_100_asset_hours": None,
@@ -281,39 +457,50 @@ def fit_selection_policy(
                 "total_events": 0,
             }
             continue
-        # Alerts use score > threshold. Place candidates immediately below an
-        # observed score so equality does not make that operating point
-        # unreachable (I.3 deterministic threshold fitting).
-        thresholds = sorted(
-            {float(np.nextafter(r["score"], -np.inf)) for r in records},
-            reverse=True,
-        )
-        best = None
-        for thr in thresholds:
-            false_alerts = sum(1 for r in non_events if r["score"] > thr)
-            per_100 = 100.0 * false_alerts / max(asset_hours, 1e-9)
-            if per_100 > FALSE_ALERT_BUDGET_PER_100_ASSET_HOURS:
-                continue
-            warned = sum(1 for r in events if r["score"] > thr)
-            recall = warned / max(len(events), 1)
-            if best is None or recall > best["recall"]:
-                best = {
-                    "threshold": float(thr),
-                    "recall": recall,
-                    "false_alerts_per_100_asset_hours": per_100,
-                    "warned_events": warned,
-                    "total_events": len(events),
-                }
-        if best is None:
-            # No threshold meets the budget: publish nothing for this task
-            # (abstention is the honest state, not a zero threshold).
-            policy[str(task)] = {
+        if thr == float("inf"):
+            policy[str(t)] = {
                 "threshold": None,
                 "status": "budget_unreachable",
                 "false_alerts_per_100_asset_hours": None,
+                "warned_events": 0,
+                "total_events": len(events_by_task[t]),
             }
-        else:
-            policy[str(task)] = {"status": "supported", **best}
+            continue
+        alerts = [
+            Alert(
+                entity=r["entity"],
+                task_index=t,
+                emission_window=r["cutoff_window"],
+                score=r["score"],
+                episode_id=r["episode"],
+            )
+            for r in records_by_task[t]
+            if r["score"] > thr
+        ]
+        alerts.sort(key=lambda a: (a.emission_window, a.entity, a.task_index))
+        m = match_events(alerts, events_by_task[t])
+        policy[str(t)] = {
+            "status": "supported",
+            "threshold": float(thr),
+            "recall": m.matched_events / max(len(events_by_task[t]), 1),
+            "false_alerts_per_100_asset_hours": (
+                100.0 * m.unmatched_alerts / max(asset_hours, 1e-9)
+            ),
+            "warned_events": m.matched_events,
+            "total_events": len(events_by_task[t]),
+        }
+    policy["_aggregate"] = {
+        "budget_per_100_asset_hours": budget,
+        "calibration_asset_hours": asset_hours,
+        "calibration_total_warned_events": best_matched,
+        "calibration_total_events": sum(
+            len(events_by_task[t]) for t in range(5)
+        ),
+        "semantics": (
+            "aggregate budget across tasks; exact M.3 matching on the "
+            "calibration split including post-event re-alerts"
+        ),
+    }
     return policy
 
 
@@ -349,10 +536,19 @@ def collect_cal_records(
                     t = tf.task_index
                     score = float(tf.distribution.cumulative_risk[PRIMARY_HORIZON - 1])
                     at_risk = bool(ex.targets.risk_mask[entity.slot, 0, t])
-                    if not at_risk:
-                        continue
+                    event_bins = ex.targets.event_y[entity.slot, :, t]
+                    has_event = bool(float(event_bins.sum()) > 0)
+                    event_bin = (
+                        int(event_bins.argmax()) + 1 if has_event else None
+                    )
                     event = bool(
-                        ex.targets.event_y[entity.slot, :PRIMARY_HORIZON, t].sum() > 0
+                        at_risk
+                        and float(
+                            ex.targets.event_y[
+                                entity.slot, :PRIMARY_HORIZON, t
+                            ].sum()
+                        )
+                        > 0
                     )
                     # complete follow-up: still at risk through the horizon's
                     # last bin (no event, full observation — M.3 false-alert
@@ -360,13 +556,20 @@ def collect_cal_records(
                     complete = bool(
                         ex.targets.risk_mask[entity.slot, PRIMARY_HORIZON - 1, t]
                     ) and ex.cutoff_window + PRIMARY_HORIZON <= 110
+                    # Records include NOT-at-risk (post-event) forecasts: the
+                    # evaluator alerts on those too, and each post-event
+                    # re-alert after cooldown can never match anything — the
+                    # selection-policy fit must see them (v2 fix).
                     records.append(
                         {
                             "task": t,
                             "entity": ex.entity_ids[entity.slot],
                             "episode": ex.episode_id,
+                            "cutoff_window": ex.cutoff_window,
                             "score": score,
+                            "at_risk": at_risk,
                             "event": event,
+                            "event_bin": event_bin,
                             "complete_followup": complete,
                             "asset_hours_weight": PRIMARY_HORIZON * 30 / 3600.0,
                         }
@@ -483,9 +686,41 @@ def main() -> None:
             "'reference:0,1,2 gate:0,1 wide:0' (I.5)"
         ),
     )
-    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="max epochs (default: 40 scratch / 20 fine-tune)",
+    )
+    parser.add_argument(
+        "--finetune",
+        action="store_true",
+        help=(
+            "warm-start members from an existing final checkpoint of the "
+            "same corpus (v2 recall recipe: per-task positive weights, "
+            "boosted catchable-task oversampling, h=10-start curriculum; "
+            "epoch-0 dev AP is banked as the selection floor)"
+        ),
+    )
+    parser.add_argument(
+        "--policy-budget",
+        type=float,
+        default=None,
+        help=(
+            "override the declared aggregate alert budget "
+            f"(default {POLICY_AGGREGATE_BUDGET}/100 asset-hours)"
+        ),
+    )
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
+    if args.epochs is None:
+        args.epochs = FINETUNE_EPOCHS if args.finetune else 40
+    recipe_tag = FINETUNE_RECIPE if args.finetune else "scratch"
+    policy_budget = (
+        args.policy_budget
+        if args.policy_budget is not None
+        else POLICY_AGGREGATE_BUDGET
+    )
 
     plan = parse_members(args.members)
 
@@ -592,20 +827,43 @@ def main() -> None:
     # Variant seed offsets decorrelate member initialization across families
     # sharing seed numbers (I.5: independently trained members).
     variant_seed_offset = {"reference": 0, "gate": 10_000, "wide": 20_000}
+    horizons, transitions = (
+        (FINETUNE_HORIZONS, FINETUNE_TRANSITIONS)
+        if args.finetune
+        else ((1, 3, 10, 30, 60), CURRICULUM_TRANSITIONS)
+    )
+    early_stop_from = 1 if args.finetune else PRIMARY_HORIZON_EPOCH
     for variant, seed in plan:
         member_key = f"{variant}:{seed}"
         checkpoint = member_checkpoint(partial_dir, variant, seed)
         resume = None
+        warm = None
         if checkpoint.exists():
             candidate = torch.load(checkpoint, map_location="cpu", weights_only=False)
-            if candidate.get("corpus_fingerprint") == corpus_fingerprint:
-                resume = candidate
-            else:
+            if candidate.get("corpus_fingerprint") != corpus_fingerprint:
                 print(
                     f"[4/8] {member_key}: stale checkpoint ignored "
                     "(corpus fingerprint changed)",
                     flush=True,
                 )
+            elif candidate.get("recipe", "scratch") != recipe_tag:
+                if args.finetune and candidate.get("final", False):
+                    warm = candidate
+                    print(
+                        f"[4/8] {member_key}: warm start from "
+                        f"{candidate.get('recipe', 'scratch')} checkpoint "
+                        f"(best epoch {candidate['summary']['best_epoch']}, "
+                        f"devAP {candidate['summary']['best_dev_mean_ap']:.3f})",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[4/8] {member_key}: checkpoint from recipe "
+                        f"{candidate.get('recipe', 'scratch')!r} ignored",
+                        flush=True,
+                    )
+            else:
+                resume = candidate
         if resume is not None:
             summary = resume["summary"]
             if resume.get("final", False):
@@ -636,46 +894,99 @@ def main() -> None:
             model.load_state_dict(
                 {k: v.to(device) for k, v in resume["state"].items()}
             )
+        elif warm is not None:
+            model.load_state_dict(
+                {k: v.to(device) for k, v in warm["state"].items()}
+            )
+        horizons, transitions = (
+            (FINETUNE_HORIZONS, FINETUNE_TRANSITIONS)
+            if args.finetune
+            else ((1, 3, 10, 30, 60), CURRICULUM_TRANSITIONS)
+        )
+        early_stop_from = 1 if args.finetune else PRIMARY_HORIZON_EPOCH
         trainer = Trainer(
             model=model,
             weights=LossWeights.from_config(config.training["loss"]),
-            learning_rate=LEARNING_RATE,
+            learning_rate=(FINETUNE_LR if args.finetune else LEARNING_RATE),
             weight_decay=float(config.training["weight_decay"]),
             gradient_clip=float(config.training["gradient_clip"]),
             epochs_max=args.epochs,
             seed=seed,
             positive_weight=SURVIVAL_POSITIVE_WEIGHT,
+            task_positive_weights=(
+                TASK_POSITIVE_WEIGHTS if args.finetune else None
+            ),
             curriculum=CurriculumSchedule(
-                horizons=(1, 3, 10, 30, 60),
-                transition_epochs=CURRICULUM_TRANSITIONS,
+                horizons=horizons,
+                transition_epochs=transitions,
             ),
         )
         train_examples = examples["train"]
+
         # Section-15 oversampling policy (recorded; corrected by I.4):
         # imminent-event clips are drawn more often so the rare positive
-        # hazard signal is not swamped by the ~99.5% negative bins.
+        # hazard signal is not swamped by the ~99.5% negative bins. The v2
+        # fine-tune draws clips with imminent lateral/C2/exfil events — the
+        # catchable tasks — harder still.
+        def clip_sampling_weight(ex) -> float:
+            per_task = ex.targets.event_y[:, :PRIMARY_HORIZON, :].sum(dim=(0, 1))
+            if args.finetune and any(
+                int(per_task[t]) > 0 for t in BOOSTED_TASKS
+            ):
+                return BOOSTED_POSITIVE_CLIP_OVERSAMPLING
+            if int(per_task.sum()) > 0:
+                return POSITIVE_CLIP_OVERSAMPLING
+            return 1.0
+
         clip_weights = np.array(
-            [
-                1.0
-                if int(ex.targets.event_y[:, :PRIMARY_HORIZON, :].sum()) == 0
-                else POSITIVE_CLIP_OVERSAMPLING
-                for ex in train_examples
-            ]
+            [clip_sampling_weight(ex) for ex in train_examples], dtype=float
         )
         clip_probs = clip_weights / clip_weights.sum()
 
+        def selection_ap(ap: dict) -> float:
+            """Dev-selection metric: catchable-task mean AP for the
+            fine-tune (v3), all-task mean for the scratch recipe."""
+            if args.finetune:
+                sel = [ap[t] for t in FINETUNE_SELECTION_TASKS if t in ap]
+                return float(np.mean(sel)) if sel else 0.0
+            return float(np.mean(list(ap.values()))) if ap else 0.0
+
+        def sampling_policy_str() -> str:
+            boost = (
+                f", {BOOSTED_POSITIVE_CLIP_OVERSAMPLING}x for imminent tasks "
+                f"{list(BOOSTED_TASKS)}"
+                if args.finetune
+                else ""
+            )
+            tw = (
+                f" per-task {list(TASK_POSITIVE_WEIGHTS)}"
+                if args.finetune
+                else ""
+            )
+            return (
+                f"positive_clip_oversampling({POSITIVE_CLIP_OVERSAMPLING}x"
+                f"{boost}) + survival positive_weight"
+                f"({SURVIVAL_POSITIVE_WEIGHT}{tw}) with recorded "
+                "probabilities; base-rate/odds shift corrected by I.4 "
+                "natural-prevalence calibration (Section 15, A12)"
+            )
+
         def run_summary_so_far() -> dict:
             return {
+                "recipe": recipe_tag,
+                "selection_metric": (
+                    "catchable_task_mean_ap"
+                    f" (tasks {list(FINETUNE_SELECTION_TASKS)})"
+                    if args.finetune
+                    else "all_task_mean_ap"
+                ),
                 "best_epoch": best_epoch,
                 "best_dev_mean_ap": best_ap,
-                "curriculum_transitions": list(CURRICULUM_TRANSITIONS),
-                "sampling_policy": (
-                    f"positive_clip_oversampling({POSITIVE_CLIP_OVERSAMPLING}x) "
-                    f"+ survival positive_weight({SURVIVAL_POSITIVE_WEIGHT}) "
-                    "with recorded probabilities; base-rate/odds shift "
-                    "corrected by I.4 natural-prevalence calibration "
-                    "(Section 15, A12)"
+                "curriculum_transitions": list(transitions),
+                "task_positive_weights": (
+                    list(TASK_POSITIVE_WEIGHTS) if args.finetune else None
                 ),
+                "sampling_policy": sampling_policy_str(),
                 "epochs": epoch_logs,
             }
 
@@ -687,6 +998,48 @@ def main() -> None:
             epoch_logs = resume["summary"]["epochs"]
             trainer.optimizer.load_state_dict(resume["optimizer"])
             start_epoch = epoch_logs[-1]["epoch"] + 1
+        elif warm is not None:
+            # Bank the warm state as epoch 0: the fine-tune's dev-selection
+            # floor is the warm-start quality, so a member can never end
+            # below where it started.
+            ap0 = dev_average_precision(model, device, dev_monitor)
+            best_ap = selection_ap(ap0)
+            best_epoch = 0
+            best_state = OrderedDict(
+                {
+                    k: v.detach().cpu().clone()
+                    for k, v in model.state_dict().items()
+                }
+            )
+            epochs_no_improve = 0
+            epoch_logs = [
+                {
+                    "epoch": 0,
+                    "horizon_bins": PRIMARY_HORIZON,
+                    "train_loss": None,
+                    "dev_average_precision": ap0,
+                    "dev_mean_ap": best_ap,
+                    "seconds": 0.0,
+                    "warm_start": True,
+                }
+            ]
+            start_epoch = 1
+            torch.save(
+                {
+                    "state": best_state,
+                    "optimizer": trainer.optimizer.state_dict(),
+                    "summary": run_summary_so_far(),
+                    "epochs_no_improve": 0,
+                    "final": False,
+                    "recipe": recipe_tag,
+                    "corpus_fingerprint": corpus_fingerprint,
+                },
+                checkpoint,
+            )
+            print(
+                f"  epoch  0 (warm start) devAP={best_ap:.3f} - banked as floor",
+                flush=True,
+            )
         else:
             best_ap = -1.0
             best_epoch = 0
@@ -737,7 +1090,7 @@ def main() -> None:
                 )
                 losses.append(log.loss["total"])
             ap = dev_average_precision(model, device, dev_monitor)
-            mean_ap = float(np.mean(list(ap.values()))) if ap else 0.0
+            mean_ap = selection_ap(ap)
             epoch_logs.append(
                 {
                     "epoch": epoch,
@@ -767,6 +1120,7 @@ def main() -> None:
                         "summary": run_summary_so_far(),
                         "epochs_no_improve": epochs_no_improve,
                         "final": False,
+                        "recipe": recipe_tag,
                         "corpus_fingerprint": corpus_fingerprint,
                     },
                     checkpoint,
@@ -781,22 +1135,27 @@ def main() -> None:
             )
             if (
                 epochs_no_improve >= EARLY_STOP_PATIENCE
-                and epoch >= PRIMARY_HORIZON_EPOCH
+                and epoch >= early_stop_from
             ):
                 print(f"  early stop at epoch {epoch} (best {best_epoch})", flush=True)
                 break
         members[(variant, seed)] = best_state
         run_summaries[member_key] = {
             "variant": variant,
+            "recipe": recipe_tag,
+            "selection_metric": (
+                "catchable_task_mean_ap"
+                f" (tasks {list(FINETUNE_SELECTION_TASKS)})"
+                if args.finetune
+                else "all_task_mean_ap"
+            ),
             "best_epoch": best_epoch,
             "best_dev_mean_ap": best_ap,
-            "curriculum_transitions": list(CURRICULUM_TRANSITIONS),
-            "sampling_policy": (
-                f"positive_clip_oversampling({POSITIVE_CLIP_OVERSAMPLING}x) "
-                f"+ survival positive_weight({SURVIVAL_POSITIVE_WEIGHT}) "
-                "with recorded probabilities; base-rate/odds shift corrected "
-                "by I.4 natural-prevalence calibration (Section 15, A12)"
+            "curriculum_transitions": list(transitions),
+            "task_positive_weights": (
+                list(TASK_POSITIVE_WEIGHTS) if args.finetune else None
             ),
+            "sampling_policy": sampling_policy_str(),
             "epochs": epoch_logs,
         }
         # Final checkpoint for this member: complete, do not resume into it.
@@ -805,6 +1164,7 @@ def main() -> None:
                 "state": best_state,
                 "summary": run_summaries[member_key],
                 "final": True,
+                "recipe": recipe_tag,
                 "corpus_fingerprint": corpus_fingerprint,
             },
             member_checkpoint(partial_dir, variant, seed),
@@ -824,15 +1184,23 @@ def main() -> None:
     gc.collect()
 
     # Sequential-member mode: the bundle is assembled ONLY when every member
-    # of the FULL default plan has a final checkpoint — a partial-plan run
+    # of the FULL default plan has a FINAL checkpoint — a partial-plan run
     # (parallel member training) exits after its own members so it can never
-    # write a partial-member manifest. The completing run assembles over the
-    # full member set, not just its own plan.
+    # write a partial-member manifest. Existence alone is not completion:
+    # a mid-training member banks non-final checkpoints, and a sibling
+    # process finishing early must not assemble those. The completing run
+    # assembles over the full member set, not just its own plan.
     full_plan = parse_members(DEFAULT_MEMBERS)
+
+    def _member_final(v, s) -> bool:
+        path = member_checkpoint(partial_dir, v, s)
+        if not path.exists():
+            return False
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        return bool(ck.get("final", False))
+
     pending = [
-        f"{v}:{s}"
-        for v, s in full_plan
-        if not member_checkpoint(partial_dir, v, s).exists()
+        f"{v}:{s}" for v, s in full_plan if not _member_final(v, s)
     ]
     if pending:
         print(
@@ -891,9 +1259,54 @@ def main() -> None:
         variant, seed = plan[mi]
         _, merged = collect_cal_records([engine], device, examples["calibration"])
         member_logits[f"{variant}:{seed}"] = merged
+    # I.4 sparse-cell rule: a task with too few events for a per-member fit
+    # falls back to a POOLED calibrator (all members' logits for that task
+    # stacked) instead of passing raw logits through. The v1 run left task 1
+    # uncalibrated and its raw ~0.99 logits dominated the Brier gap.
+    from foresight.calibration.hazard import DEFAULT_MIN_EVENTS
+
+    pooled_by_task: dict[int, dict] = {}
+    all_tasks = sorted({t for m in member_logits for t in member_logits[m]})
+    for task in all_tasks:
+        parts = [
+            member_logits[m][task]
+            for m in member_logits
+            if task in member_logits[m]
+        ]
+        sparse_members = [
+            m
+            for m in member_logits
+            if task in member_logits[m]
+            and int(member_logits[m][task][1].sum()) < DEFAULT_MIN_EVENTS
+        ]
+        if not sparse_members or not parts:
+            continue
+        stacked = tuple(
+            torch.cat([p[i] for p in parts], dim=0) for i in range(3)
+        )
+        if int(stacked[1].sum()) >= DEFAULT_MIN_EVENTS:
+            cal = fit_hazard_calibrator(*stacked, task_index=task, pooled=True)
+            pooled_by_task[task] = cal.to_dict()
+            print(
+                f"  pooled task {task}: fitted={cal.fitted} "
+                f"slope={cal.slope:.3f} events={cal.fit_event_count} "
+                f"(sparse-cell fallback for {len(sparse_members)} members)",
+                flush=True,
+            )
     for mi, (variant, seed) in enumerate(plan):
         member_key = f"{variant}:{seed}"
         for task, (logits, events, masks) in member_logits[member_key].items():
+            if (
+                int(events.sum()) < DEFAULT_MIN_EVENTS
+                and task in pooled_by_task
+            ):
+                calibrators_payload[f"{member_key}:{task}"] = pooled_by_task[task]
+                print(
+                    f"  {member_key} task {task}: pooled "
+                    f"(events={pooled_by_task[task]['fit_event_count']})",
+                    flush=True,
+                )
+                continue
             cal = fit_hazard_calibrator(logits, events, masks, task_index=task)
             calibrators_payload[f"{member_key}:{task}"] = cal.to_dict()
             print(
@@ -920,8 +1333,9 @@ def main() -> None:
     cal_records, _ = collect_cal_records(
         calibrated_engines, device, examples["calibration"]
     )
-    policy = fit_selection_policy(cal_records)
-    for task, p in sorted(policy.items(), key=lambda kv: int(kv[0])):
+    policy = fit_selection_policy(cal_records, budget=policy_budget)
+    for task in sorted((k for k in policy if k != "_aggregate"), key=int):
+        p = policy[task]
         print(
             f"  task {task}: {p['status']} "
             + (
@@ -985,6 +1399,13 @@ def main() -> None:
             {
                 "schema": "foresight.core.2026-09",
                 "profile": "foresight-section35-tierb-ensemble",
+                "recipe": recipe_tag,
+                "task_positive_weights": (
+                    list(TASK_POSITIVE_WEIGHTS) if args.finetune else None
+                ),
+                "selection_policy_budget_aggregate_per_100_asset_hours": (
+                    POLICY_AGGREGATE_BUDGET
+                ),
                 "synthetic_data_only": True,
                 "seeds": [s for v, s in plan if v == "reference"],
                 "members": [
@@ -1031,13 +1452,17 @@ def main() -> None:
     (bundle / "training_run.json").write_text(
         json.dumps(
             {
+                "recipe": recipe_tag,
                 "seeds": {str(k): v for k, v in run_summaries.items()},
                 "curriculum": {
-                    "horizons": [1, 3, 10, 30, 60],
-                    "transition_epochs": list(CURRICULUM_TRANSITIONS),
+                    "horizons": list(horizons),
+                    "transition_epochs": list(transitions),
                 },
                 "early_stop_patience": EARLY_STOP_PATIENCE,
                 "batch_clips": 16,
+                "selection_policy_budget_aggregate_per_100_asset_hours": (
+                    POLICY_AGGREGATE_BUDGET
+                ),
                 "elapsed_seconds": round(time.time() - t_start, 1),
             },
             indent=2,

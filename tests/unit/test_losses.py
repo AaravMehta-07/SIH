@@ -103,6 +103,60 @@ class TestTR01SurvivalHandCalculation:
         assert torch.isfinite(loss)
 
 
+class TestTaskPositiveWeights:
+    """The per-task form (v2 fine-tune recipe) must reduce to the scalar
+    form when every task carries the same weight, reject shape mismatches,
+    and shift the weighted mean toward the heavier task's bins."""
+
+    def _inputs(self, seed: int = 0):
+        g = torch.Generator().manual_seed(seed)
+        logits = torch.randn(3, 4, 5, generator=g)          # [N, H, J]
+        event_y = (torch.rand(3, 4, 5, generator=g) < 0.2).float()
+        risk_mask = torch.ones(3, 4, 5, dtype=torch.bool)
+        return logits, event_y, risk_mask
+
+    def test_uniform_task_weights_match_scalar(self):
+        logits, event_y, risk_mask = self._inputs()
+        scalar, _ = masked_survival_nll(
+            logits, event_y, risk_mask, positive_weight=4.0
+        )
+        task, _ = masked_survival_nll(
+            logits, event_y, risk_mask, task_positive_weights=(4.0,) * 5
+        )
+        assert float(task) == pytest.approx(float(scalar), abs=1e-6)
+
+    def test_weight_one_matches_unweighted(self):
+        logits, event_y, risk_mask = self._inputs()
+        base, _ = masked_survival_nll(logits, event_y, risk_mask)
+        task, _ = masked_survival_nll(
+            logits, event_y, risk_mask, task_positive_weights=(1.0,) * 5
+        )
+        assert float(task) == pytest.approx(float(base), abs=1e-6)
+
+    def test_shape_mismatch_is_a_contract_error(self):
+        logits, event_y, risk_mask = self._inputs()
+        with pytest.raises(ContractError):
+            masked_survival_nll(
+                logits, event_y, risk_mask, task_positive_weights=(1.0, 2.0)
+            )
+
+    def test_heavier_task_dominates_the_weighted_mean(self):
+        logits, event_y, risk_mask = self._inputs()
+        # all event mass in task 3; weight only task 3
+        event_y = torch.zeros_like(event_y)
+        event_y[:, :, 3] = 1.0
+        risk_mask = torch.zeros_like(risk_mask)
+        risk_mask[:, :, 3] = True
+        heavy, _ = masked_survival_nll(
+            logits, event_y, risk_mask, task_positive_weights=(1.0, 1.0, 1.0, 9.0, 1.0)
+        )
+        direct, _ = masked_survival_nll(
+            logits[:, :, 3], event_y[:, :, 3], risk_mask[:, :, 3],
+            positive_weight=9.0,
+        )
+        assert float(heavy) == pytest.approx(float(direct), abs=1e-6)
+
+
 class TestGaussianNLL:
     def test_hand_calculation(self):
         """v=1, m=0, s=1 (log_scale=0): 0.5*1 + 0 + 0.5*log(2*pi)."""

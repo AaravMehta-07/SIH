@@ -96,6 +96,7 @@ class Trainer:
     curriculum: CurriculumSchedule = field(default_factory=CurriculumSchedule)
     sampling_policy: str = DEFAULT_SAMPLING_POLICY
     positive_weight: float = 1.0
+    task_positive_weights: tuple[float, ...] | None = None
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -183,6 +184,7 @@ class Trainer:
             breakdown = compute_clip_loss(
                 outputs, targets, self.weights,
                 positive_weight=self.positive_weight,
+                task_positive_weights=self.task_positive_weights,
             )
             (breakdown.total / len(batch)).backward()
             totals.append(breakdown)
@@ -278,6 +280,7 @@ class Trainer:
                 compute_clip_loss(
                     sliced, targets, self.weights,
                     positive_weight=self.positive_weight,
+                    task_positive_weights=self.task_positive_weights,
                 )
             )
         # One backward through the shared batched graph: per-clip losses are
