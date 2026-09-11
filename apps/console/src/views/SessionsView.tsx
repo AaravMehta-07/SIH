@@ -2,6 +2,7 @@
 // sessions, source format, capabilities, parse status. Not promotional.
 
 import { useState } from "react";
+import { ArrowUpRight, FileStack, Search, Database } from "lucide-react";
 import type { CatalogEntry, SessionSummary } from "../types";
 import { ErrorPanel, LoadingPanel } from "../components/charts";
 
@@ -30,6 +31,9 @@ export function SessionsView({
   error: string | null;
 }) {
   const [opening, setOpening] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [source, setSource] = useState("all");
+  const visible = catalog.filter(entry => `${entry.title} ${entry.campaign}`.toLowerCase().includes(search.toLowerCase()) && (source === "all" || (source === "synthetic") === entry.synthetic));
 
   const open = async (catalogId: string) => {
     setOpening(catalogId);
@@ -46,20 +50,26 @@ export function SessionsView({
         <div>
           <h1>Capture sessions</h1>
           <p className="sub">
-            Offline capture replays through the Section-26 pipeline. Each source
-            discloses which flow and packet measurements are actually available.
+            Registered traffic sources. Isolated replay. Explicit sensor coverage.
           </p>
         </div>
       </div>
 
       {error && <ErrorPanel message={error} />}
+      <div className="catalog-tools">
+        <div className="horizon-tabs" role="group" aria-label="Capture source filter">
+          {["all", "synthetic", "real"].map(kind => <button key={kind} aria-pressed={source === kind} className={source === kind ? "active" : ""} onClick={() => setSource(kind)}>{kind === "all" ? `All sources (${catalog.length})` : kind === "real" ? "Real captures" : "Synthetic"}</button>)}
+        </div>
+        <label className="search-field"><Search size={15} /><input aria-label="Search captures" placeholder="Search captures" value={search} onChange={e => setSearch(e.target.value)} /></label>
+      </div>
 
       <div className="catalog">
-        {catalog.map((entry) => {
+        {visible.map((entry) => {
           const attack = entry.campaign.startsWith("web") || entry.campaign.startsWith("c2")
             || entry.campaign.startsWith("slow") || entry.campaign.startsWith("cred");
           return (
             <div className="catalog-card" key={entry.catalog_id}>
+              <div className="capture-index">{entry.synthetic ? <FileStack size={23} strokeWidth={1.5} /> : <Database size={23} strokeWidth={1.5} />}<span>{entry.catalog_id.toUpperCase()}</span></div>
               <div className="card-meta">
                 <span className={`tag ${attack ? "attack" : "benign"}`}>
                   {FAMILY_LABEL[entry.campaign] ?? entry.campaign}
@@ -78,13 +88,15 @@ export function SessionsView({
                   disabled={entry.available === false || opening === entry.catalog_id || loading}
                 >
                   {entry.available === false
-                    ? "Dataset not installed"
+                    ? "Unavailable"
                     : opening === entry.catalog_id ? "Opening…" : "Open session"}
+                  <ArrowUpRight size={14} aria-hidden="true" />
                 </button>
               </div>
             </div>
           );
         })}
+        {visible.length === 0 && catalog.length > 0 && <div className="empty-state">No captures match this filter.</div>}
         {catalog.length === 0 && !loading && (
           <div className="panel" style={{ gridColumn: "1/-1" }}>
             <div className="empty-state">

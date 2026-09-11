@@ -6,6 +6,8 @@
 // without concealment.
 
 import { useState } from "react";
+import { LockKeyhole, ShieldCheck, ArrowRight } from "lucide-react";
+import { CopyButton } from "../components/CopyButton";
 import type { ForecastPayload, RevealPayload, SessionSummary } from "../types";
 import { TASKS } from "../types";
 import { api } from "../api";
@@ -74,10 +76,7 @@ export function ReplayView({
         <div>
           <h1>Sealed replay</h1>
           <p className="sub">
-            Advance the decision cutoff, forecast, commit — then reveal the
-            withheld future. Time is virtual replay time; the forecast endpoint
-            never sees future labels (SE02). Outcomes are scored without
-            concealment.
+            Commitment before comparison. Virtual replay time; observed outcomes remain separate from forecasts.
           </p>
         </div>
       </div>
@@ -117,8 +116,8 @@ export function ReplayView({
             </span>
           </div>
           <div className="t-lock">
-            <span className="lock-glyph" aria-hidden="true">⌛</span>
-            <span className="lock-text">Future locked</span>
+            <span className="lock-glyph" aria-hidden="true">{reveal ? <ShieldCheck size={32} strokeWidth={1.3} /> : <LockKeyhole size={32} strokeWidth={1.3} />}</span>
+            <span className="lock-text">{reveal ? "Future revealed" : "Future locked"}</span>
           </div>
           <div className="t-side right">
             <span className="t-label" style={{ color: "var(--accent)" }}>
@@ -132,12 +131,7 @@ export function ReplayView({
             {record && (
               <span className="hash-chip" style={{ marginTop: 4 }}>
                 <span>{record.forecast_hash.slice(0, 18)}…</span>
-                <button
-                  onClick={() => navigator.clipboard?.writeText(record.forecast_hash)}
-                  aria-label="copy forecast hash"
-                >
-                  copy
-                </button>
+                <CopyButton value={record.forecast_hash} />
               </span>
             )}
           </div>
@@ -146,11 +140,12 @@ export function ReplayView({
         {/* reveal CTA or outcome board */}
         {!reveal ? (
           <div className="reveal-cta">
-            <button className="btn primary" onClick={doReveal} disabled={revealing || !record}>
+            <button className="btn primary" onClick={doReveal} disabled={revealing || !record || forecast?.cutoff_window !== cutoffWindow}>
               {revealing ? "Revealing…" : "Reveal future"}
+              <ArrowRight size={15} />
             </button>
             <span className="muted" style={{ fontSize: 11.5 }}>
-              evaluator-side authority · ground truth was never available to the forecast
+              Reveal does not modify the committed forecast.
             </span>
           </div>
         ) : (

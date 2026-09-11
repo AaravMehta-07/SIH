@@ -145,263 +145,65 @@ export interface TimelineSeries {
 }
 
 export function RiskTimeline({
-  series,
-  binSeconds,
-  horizonMinutes,
-  height = 250,
-  focusTask,
+  series, binSeconds, horizonMinutes, height = 250, focusTask,
 }: {
-  series: TimelineSeries[];
-  binSeconds: number;
-  horizonMinutes: number;
-  height?: number;
-  focusTask?: number | null;
+  series: TimelineSeries[]; binSeconds: number; horizonMinutes: number;
+  height?: number; focusTask?: number | null;
 }) {
-  const [hover, setHover] = useState<{ x: number; bin: number } | null>(null);
+  const [hoverBin, setHoverBin] = useState<number | null>(null);
+  const [active, setActive] = useState<string | null>(null);
+  const [width, setWidth] = useState(320);
   const frameRef = useRef<HTMLDivElement>(null);
-
-  const width = 920;
-  const m = { top: 16, right: 118, bottom: 30, left: 46 };
-  const iw = width - m.left - m.right;
-  const ih = height - m.top - m.bottom;
-  const bins = series[0]?.values.length ?? 0;
-
-  const x = (bin: number) => m.left + (bin / Math.max(bins - 1, 1)) * iw;
-  const y = (v: number) => m.top + (1 - v) * ih;
-
-  const horizonBins = (horizonMinutes * 60) / binSeconds;
-
-  const onMove = (event: React.MouseEvent<SVGSVGElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    const px = ((event.clientX - rect.left) / rect.width) * width;
-    const bin = Math.round(((px - m.left) / iw) * (bins - 1));
-    if (bin >= 0 && bin < bins) {
-      setHover({ x: px, bin });
-    } else {
-      setHover(null);
-    }
-  };
-
-  const yTicks = [0, 0.25, 0.5, 0.75, 1];
-
-  return (
-    <div ref={frameRef} className="chart-frame">
-      {series.length > 1 && (
-        <div className="chart-legend" aria-label="series legend">
-          {series.map((s) => (
-            <span
-              key={s.key}
-              className={`lg-item ${s.dashed ? "dashed" : ""}`}
-              style={{ color: s.color }}
-            >
-              <span className="swatch" style={{ background: s.dashed ? "transparent" : s.color }} />
-              <span style={{ color: "var(--ink-2)" }}>{s.label}</span>
-            </span>
-          ))}
-        </div>
-      )}
-      <svg
-        viewBox={`0 0 ${width} ${height}`}
-        style={{ width: "100%", display: "block" }}
-        onMouseMove={onMove}
-        onMouseLeave={() => setHover(null)}
-        role="img"
-        aria-label="cumulative risk over the forecast horizon"
-      >
-        {/* horizontal grid */}
-        {yTicks.map((t) => (
-          <g key={t}>
-            <line
-              x1={m.left}
-              x2={width - m.right}
-              y1={y(t)}
-              y2={y(t)}
-              stroke="var(--grid)"
-              strokeWidth={1}
-            />
-            <text
-              x={m.left - 8}
-              y={y(t) + 3.5}
-              textAnchor="end"
-              fontSize={10.5}
-              fill="var(--ink-3)"
-              fontFamily="var(--mono)"
-            >
-              {Math.round(t * 100)}%
-            </text>
-          </g>
-        ))}
-
-        {/* published-horizon markers */}
-        {[5, 15, 30].map((h) => {
-          const bin = (h * 60) / binSeconds - 1;
-          if (bin > bins - 1) return null;
-          return (
-            <g key={h}>
-              <line
-                x1={x(bin)}
-                x2={x(bin)}
-                y1={m.top}
-                y2={m.top + ih}
-                stroke="var(--grid)"
-                strokeWidth={1}
-                strokeDasharray="2 4"
-              />
-              <text
-                x={x(bin)}
-                y={height - 10}
-                textAnchor="middle"
-                fontSize={10}
-                fill="var(--ink-3)"
-              >
-                {h}m
-              </text>
-            </g>
-          );
-        })}
-        {/* model-horizon end */}
-        <line
-          x1={x(bins - 1)}
-          x2={x(bins - 1)}
-          y1={m.top}
-          y2={m.top + ih}
-          stroke="var(--border-strong)"
-          strokeWidth={1}
-        />
-
-        {/* crosshair */}
-        {hover && (
-          <line
-            x1={x(hover.bin)}
-            x2={x(hover.bin)}
-            y1={m.top}
-            y2={m.top + ih}
-            stroke="var(--border-strong)"
-            strokeWidth={1}
-          />
-        )}
-
-        {/* series */}
-        {(() => {
-          // Stagger the direct labels so converging series (e.g. all near
-          // 1.0) never stack their end labels on one y (K.3: no overlapping
-          // text).
-          const endYs = series.map((s) => {
-            const clipped = s.values.slice(0, horizonBins);
-            return y(clipped[clipped.length - 1] ?? 0);
-          });
-          const order = endYs
-            .map((v, i) => ({ v, i }))
-            .sort((a, b) => a.v - b.v);
-          const MIN_GAP = 16;
-          for (let k = 1; k < order.length; k++) {
-            if (order[k].v - order[k - 1].v < MIN_GAP) {
-              order[k].v = order[k - 1].v + MIN_GAP;
-            }
-          }
-          const labelY = new Map<number, number>();
-          for (const o of order) labelY.set(o.i, o.v);
-          return series.map((s) => {
-            const clipped = s.values.slice(0, horizonBins);
-            const last = clipped.length - 1;
-            if (last < 0) return null;
-            const path = clipped
-              .map((v, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(v).toFixed(1)}`)
-              .join(" ");
-            const fp = fingerprint([
-              s.key,
-              clipped.length,
-              clipped[0]?.toFixed(4),
-              clipped[last]?.toFixed(4),
-              s.threshold,
-            ]);
-            return (
-              <g key={fp}>
-                {s.threshold != null && s.threshold > 0 && s.threshold < 1 && (
-                  <line
-                    className="fade-line"
-                    x1={m.left}
-                    x2={x(last)}
-                    y1={y(s.threshold)}
-                    y2={y(s.threshold)}
-                    stroke={s.color}
-                    strokeWidth={1}
-                    strokeDasharray="5 4"
-                    opacity={0.55}
-                  />
-                )}
-                <path
-                  d={path}
-                  fill="none"
-                  stroke={s.color}
-                  strokeWidth={focusTask != null && focusTask !== Number(s.key) ? 1.25 : 2}
-                  strokeDasharray={s.dashed ? "5 4" : undefined}
-                  pathLength={s.dashed ? undefined : 1}
-                  className={s.dashed ? "fade-line" : "draw-line"}
-                  opacity={focusTask != null && focusTask !== Number(s.key) ? 0.38 : 1}
-                  strokeLinecap="round"
-                />
-                <text
-                  x={x(last) + 7}
-                  y={(labelY.get(series.indexOf(s)) ?? y(clipped[last])) + 3.5}
-                  fontSize={10.5}
-                  fill="var(--ink-2)"
-                >
-                  {s.label}
-                </text>
-                {hover && (
-                  <circle
-                    cx={x(Math.min(hover.bin, last))}
-                    cy={y(clipped[Math.min(hover.bin, last)])}
-                    r={3.5}
-                    fill={s.color}
-                    stroke="var(--chart)"
-                    strokeWidth={1.5}
-                  />
-                )}
-              </g>
-            );
-          });
-        })()}
-      </svg>
-
-      {hover && (
-        <div
-          className="chart-tooltip"
-          style={{
-            left: Math.min(
-              (hover.x / width) * (frameRef.current?.clientWidth ?? 0) + 18,
-              (frameRef.current?.clientWidth ?? 400) - 190,
-            ),
-            top: 12,
-          }}
-        >
-          <div className="tt-title">
-            +{((hover.bin + 1) * binSeconds) / 60 >= 1
-              ? `${Math.round(((hover.bin + 1) * binSeconds) / 60)} min`
-              : `${(hover.bin + 1) * binSeconds}s`}{" "}
-            after cutoff
-          </div>
-          {series
-            .slice()
-            .sort(
-              (a, b) =>
-                (b.values[Math.min(hover.bin, b.values.length - 1)] ?? 0) -
-                (a.values[Math.min(hover.bin, a.values.length - 1)] ?? 0),
-            )
-            .map((s) => (
-              <div className="tt-row" key={s.key}>
-                <span className="swatch" style={{ background: s.color }} />
-                <span>{s.label}</span>
-                <span className="tt-val">
-                  {pct(s.values[Math.min(hover.bin, s.values.length - 1)])}
-                </span>
-              </div>
-            ))}
-        </div>
-      )}
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const observer = new ResizeObserver(([entry]) => setWidth(Math.max(240, entry.contentRect.width)));
+    observer.observe(frame);
+    return () => observer.disconnect();
+  }, []);
+  const bins = Math.min(Math.floor(horizonMinutes * 60 / binSeconds), ...series.map(s => s.values.length));
+  const m = { top: 14, right: 14, bottom: 29, left: 35 };
+  const iw = width - m.left - m.right, ih = height - m.top - m.bottom;
+  const maximum = Math.max(0.01, ...series.flatMap(s => s.values.slice(0, bins)));
+  const ceiling = maximum <= .05 ? .05 : maximum <= .1 ? .1 : maximum <= .25 ? .25 : maximum <= .5 ? .5 : 1;
+  const x = (bin: number) => m.left + ((bin + 1) / Math.max(bins, 1)) * iw;
+  const y = (value: number) => m.top + (1 - value / ceiling) * ih;
+  const selected = active ?? (focusTask != null ? String(focusTask) : null);
+  const probe = hoverBin == null ? bins - 1 : Math.min(hoverBin, bins - 1);
+  return <div ref={frameRef} className="chart-frame risk-timeline">
+    <div className="chart-legend" aria-label="series legend">
+      {series.map(s => <button key={s.key} className="lg-item" aria-pressed={active === s.key}
+        onClick={() => setActive(active === s.key ? null : s.key)} title={`Highlight ${s.label}`}>
+        <span className="swatch" style={{ background: s.color }} />
+        <span>{s.label}</span><b>{pct(s.values[probe])}</b>
+      </button>)}
     </div>
-  );
+    <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", display: "block" }}
+      role="slider" tabIndex={0} aria-label="Forecast time, use arrow keys to inspect risk"
+      aria-valuemin={binSeconds} aria-valuemax={bins * binSeconds} aria-valuenow={(probe + 1) * binSeconds}
+      aria-valuetext={`${(probe + 1) * binSeconds} seconds after cutoff: ${series.map(s => `${s.label} ${pct(s.values[probe])}`).join(", ")}`}
+      onKeyDown={e => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); setHoverBin(Math.max(0, Math.min(bins - 1, probe + (e.key === "ArrowLeft" ? -1 : 1)))); } }}
+      onMouseMove={e => { const box = e.currentTarget.getBoundingClientRect(); const px = (e.clientX - box.left) / box.width * width; setHoverBin(Math.max(0, Math.min(bins - 1, Math.round((px - m.left) / iw * bins) - 1))); }}
+      onMouseLeave={() => setHoverBin(null)} onBlur={() => setHoverBin(null)}>
+      {[0, .25, .5, .75, 1].map(f => <g key={f}>
+        <line x1={m.left} x2={width-m.right} y1={y(f*ceiling)} y2={y(f*ceiling)} stroke="var(--grid)" strokeDasharray={f ? "2 3" : undefined} />
+        <text x={m.left-6} y={y(f*ceiling)+3} textAnchor="end" fontSize={9} fill="var(--ink-3)">{+(f*ceiling*100).toFixed(2)}%</text>
+      </g>)}
+      {[0, .5, 1].map(f => <text key={f} x={m.left+f*iw} y={height-8} textAnchor={f === 0 ? "start" : f === 1 ? "end" : "middle"} fontSize={9} fill="var(--ink-3)">{+(f*bins*binSeconds/60).toFixed(1)}m</text>)}
+      {series.map(s => {
+        const values = s.values.slice(0,bins);
+        const d = values.map((v,i) => `${i ? "L" : "M"}${x(i)},${y(v)}`).join(" ");
+        return <path key={fingerprint([s.key, bins, values[0], values[values.length-1]])} d={d} fill="none"
+          stroke={s.color} strokeWidth={selected === s.key ? 2.5 : 1.7} opacity={selected && selected !== s.key ? .18 : 1}
+          strokeLinecap="round" pathLength={1} className="draw-line"><title>{s.label}: {pct(values[values.length-1])}</title></path>;
+      })}
+      {hoverBin != null && <g>
+        <line x1={x(probe)} x2={x(probe)} y1={m.top} y2={height-m.bottom} stroke="var(--ink-3)" strokeDasharray="3 3" />
+        {series.map(s => <circle key={s.key} cx={x(probe)} cy={y(s.values[probe])} r={3} fill={s.color} stroke="var(--panel)" strokeWidth={1.5} />)}
+      </g>}
+    </svg>
+    <div className="chart-readout">{hoverBin == null ? `Cumulative probability · ${horizonMinutes}-minute horizon` : `At +${(probe+1)*binSeconds} seconds · backend forecast`}</div>
+  </div>;
 }
 
 /* ------------------------------------------------------------------ */

@@ -89,7 +89,7 @@ export function EvaluationView({
                   {evaluation.golden_example_1.no_event_matches ? "✓ no-event mass" : "✗ no-event mass"}
                 </span>
                 <span className={`tag ${evaluation.golden_example_1.conditional_median_bin === evaluation.golden_example_1.expected_median_bin ? "benign" : "attack"}`}>
-                  ✓ conditional median = bin {evaluation.golden_example_1.conditional_median_bin}
+                  {evaluation.golden_example_1.conditional_median_bin === evaluation.golden_example_1.expected_median_bin ? "✓" : "✗"} conditional median = bin {evaluation.golden_example_1.conditional_median_bin ?? "unavailable"}
                 </span>
               </div>
             </div>
@@ -214,7 +214,6 @@ export function EvaluationView({
                       }))}
                     />
                     <div className="muted" style={{ marginTop: 10 }}>
-                      Prevalence ~0.5-1%: AP 0.3 ≈ a 30-60x lift over base rate.
                       Tasks with no test positives report "—" honestly.
                     </div>
                   </div>

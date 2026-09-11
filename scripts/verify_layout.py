@@ -6,16 +6,18 @@ judgment — no horizontal overflow, charts have drawn marks, panels stack,
 and the timeline's direct labels do not collide.
 """
 
+import os
 import sys
 import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-BASE = "http://127.0.0.1:8031"
-OUT = Path(__file__).resolve().parents[1] / "artifacts" / "screens"
+BASE = os.environ.get("FORESIGHT_VERIFY_BASE", "http://127.0.0.1:8031")
+OUT = Path(os.environ.get("FORESIGHT_VERIFY_OUT",
+    Path(__file__).resolve().parents[1] / "reports" / "console"))
 
-WIDTHS = [1440, 1180, 900, 640, 420]
+WIDTHS = [1920, 1440, 1366, 1180, 900, 640, 420]
 
 
 def check_overflow(page) -> bool:
@@ -25,6 +27,7 @@ def check_overflow(page) -> bool:
 
 
 def main() -> int:
+    OUT.mkdir(parents=True, exist_ok=True)
     failures = []
     with sync_playwright() as p:
         browser = p.chromium.launch()

@@ -48,7 +48,9 @@ PROFILE_DIR = Path(
     os.environ.get("FORESIGHT_PROFILE_DIR", REPO_ROOT / "artifacts" / "profile")
 )
 CTU_PROFILE_DIR = REPO_ROOT / "artifacts" / "ctu13" / "profile"
-RUNTIME_STORE = REPO_ROOT / "artifacts" / "runtime-store"
+RUNTIME_STORE = Path(os.environ.get(
+    "FORESIGHT_RUNTIME_STORE", REPO_ROOT / "artifacts" / "runtime-store"
+))
 
 _bundle: RuntimeBundle | None = None
 _ctu_bundle: RuntimeBundle | None = None

@@ -51,13 +51,13 @@ function deriveAxes(forecast: ForecastPayload | null): Axis[] {
     {
       name: "Forecast support",
       value: supported ? "supported" : "abstained",
-      compat: supported ? "· 5 targets" : "",
+      compat: supported ? `· ${new Set(forecast.entities.flatMap(e => e.tasks.filter(t => t.status === "supported").map(t => t.task_index))).size} targets` : "",
       tone: supported ? "ok" : "warn",
       detail: "Whether the stated task can be published (Section 18)",
     },
     {
       name: "Threat evidence",
-      value: alerting ? "elevated" : "low",
+      value: alerting ? "elevated" : supported ? "low" : "unavailable",
       compat: alerting ? "· alerting" : "",
       tone: alerting ? "alert" : "ok",
       detail:

@@ -3,7 +3,8 @@
 // Section-18 axes; the amber disclosure keeps the weights profile explicit
 // in every state. Keyboard: 1-5 switch screens when a session is open.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Activity, Boxes, ChartNoAxesCombined, Fingerprint, GitBranch, History, ShieldCheck, ChevronDown, Radio } from "lucide-react";
 import { api } from "./api";
 import { StatusStrip } from "./components/StatusStrip";
 import { EvaluationView } from "./views/EvaluationView";
@@ -36,6 +37,7 @@ const VIEWS: { id: View; label: string; key: string }[] = [
   { id: "replay", label: "Replay", key: "5" },
   { id: "evaluation", label: "Evaluation", key: "6" },
 ];
+const VIEW_ICONS = [Boxes, Activity, Fingerprint, GitBranch, History, ChartNoAxesCombined];
 
 export default function App() {
   const [view, setView] = useState<View>("sessions");
@@ -52,18 +54,22 @@ export default function App() {
   const [evalLoading, setEvalLoading] = useState(false);
   const [evalError, setEvalError] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(true);
+  const forecastRequest = useRef(0);
 
   useEffect(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
     api
       .catalog()
       .then((c) => setCatalog(c.catalog))
-      .catch(() => setCatalog([]));
+      .catch((e) => setSessionError(e.message))
+      .finally(() => setCatalogLoading(false));
   }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
+      if (e.altKey || e.ctrlKey || e.metaKey || e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement || (e.target instanceof HTMLElement && e.target.isContentEditable)) return;
       const hit = VIEWS.find((v) => v.key === e.key);
       if (hit && (hit.id === "sessions" || hit.id === "evaluation" || session)) {
         setView(hit.id);
@@ -75,16 +81,20 @@ export default function App() {
 
   const refreshForecast = useCallback(
     async (sessionId: string, cutoff: number) => {
+      const requestId = ++forecastRequest.current;
       setForecastLoading(true);
+      setForecast(null);
       setForecastError(null);
       try {
         const payload = await api.forecast(sessionId, cutoff);
+        if (requestId !== forecastRequest.current) return;
         setForecast(payload);
       } catch (e) {
+        if (requestId !== forecastRequest.current) return;
         setForecastError(String((e as Error).message ?? e));
         setForecast(null);
       } finally {
-        setForecastLoading(false);
+        if (requestId === forecastRequest.current) setForecastLoading(false);
       }
     },
     [],
@@ -93,6 +103,7 @@ export default function App() {
   const openSession = useCallback(
     async (catalogId: string) => {
       setOpening(true);
+      setSessionError(null);
       try {
         const created = await api.createSession(catalogId);
         const detail = await api.session(created.session_id);
@@ -106,6 +117,8 @@ export default function App() {
         setCutoffWindow(cutoff);
         setView("forecast");
         void refreshForecast(detail.session_id, cutoff);
+      } catch (e) {
+        setSessionError((e as Error).message);
       } finally {
         setOpening(false);
       }
@@ -117,16 +130,12 @@ export default function App() {
     (s: SessionSummary) => {
       setSession(s);
       setSelectedEntity(null);
-      if (!s.valid_cutoffs.includes(cutoffWindow)) {
-        const cutoff = s.valid_cutoffs[Math.floor(s.valid_cutoffs.length * 0.55)];
-        setCutoffWindow(cutoff);
-      }
+      const cutoff = s.valid_cutoffs.includes(cutoffWindow) ? cutoffWindow : s.valid_cutoffs[Math.floor(s.valid_cutoffs.length * 0.55)];
+      setCutoffWindow(cutoff);
       setView("forecast");
       void refreshForecast(
         s.session_id,
-        s.valid_cutoffs.includes(cutoffWindow)
-          ? cutoffWindow
-          : s.valid_cutoffs[s.valid_cutoffs.length - 1],
+        cutoff,
       );
     },
     [cutoffWindow, refreshForecast],
@@ -141,14 +150,14 @@ export default function App() {
   );
 
   const loadEvaluation = useCallback(() => {
-    if (evaluation || evalLoading) return;
+    if (evaluation || evalLoading || evalError) return;
     setEvalLoading(true);
     api
       .evaluation()
       .then(setEvaluation)
       .catch((e) => setEvalError(String((e as Error).message ?? e)))
       .finally(() => setEvalLoading(false));
-  }, [evaluation, evalLoading]);
+  }, [evaluation, evalLoading, evalError]);
 
   useEffect(() => {
     if (view === "evaluation") loadEvaluation();
@@ -168,30 +177,27 @@ export default function App() {
     <>
       <header className="topbar">
         <div className="brand">
-          <svg className="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
-            <circle cx="16" cy="16" r="13.5" fill="none" stroke="#35b8b0" strokeWidth="1.6" opacity="0.85" />
-            <circle cx="16" cy="16" r="8.5" fill="none" stroke="#35b8b0" strokeWidth="1.2" opacity="0.5" />
-            <circle cx="16" cy="16" r="3.4" fill="#35b8b0" />
-            <path d="M16 2.5 A13.5 13.5 0 0 1 29.5 16" fill="none" stroke="#e8edf4" strokeWidth="1.8" strokeLinecap="round" />
-            <circle cx="24.5" cy="7.5" r="2.1" fill="#d95926" />
-          </svg>
+          <ShieldCheck className="brand-mark" aria-hidden="true" />
           <span>
             <span className="brand-name">FORESIGHT</span>
-            <span className="brand-sub">NETWORK ATTACK FORECASTING · OFFLINE</span>
+            <span className="brand-sub">Network intelligence</span>
           </span>
         </div>
         <nav className="nav" aria-label="console screens">
-          {VIEWS.map((v) => (
+          {VIEWS.map((v, i) => {
+            const Icon = VIEW_ICONS[i];
+            return (
             <button
               key={v.id}
               className={view === v.id ? "active" : ""}
               disabled={!hasSession && v.id !== "sessions" && v.id !== "evaluation"}
               onClick={() => setView(v.id)}
+              aria-current={view === v.id ? "page" : undefined}
               title={v.id === "sessions" || v.id === "evaluation" || hasSession ? `Screen ${v.key}` : "Open a session first"}
             >
-              {v.label}
+              <Icon size={18} aria-hidden="true" /><span>{v.label}</span>
             </button>
-          ))}
+          );})}
         </nav>
         <div className="spacer" />
         <span className="session-chip" title={session ? session.title : "no active session"}>
@@ -209,22 +215,23 @@ export default function App() {
           title={health?.weights_profile ?? ""}
         >
           <span className="dot" />
-          {health ? (health.trained ? "Trained profile" : "Untrained · disclosed") : "…"}
+          {health ? (!health.model_ready ? "Model unavailable" : health.trained ? "Trained profile" : "Untrained · disclosed") : "Connecting"}
         </span>
+        <div className="rail-footer"><Radio size={14} /> Local workspace <span>SIH26153 / Deja Vu T-1</span></div>
       </header>
 
-      <StatusStrip forecast={view === "forecast" || view === "evidence" ? forecast : null} />
+      <StatusStrip forecast={forecast} />
 
       <main className="main">
-        <div className="disclosure" role="note">
-          <span className="icon" aria-hidden="true">⚠</span>
-          <span>
+        <details className="disclosure">
+          <summary><ShieldCheck size={15} /><b>Evidence-accountable forecasting</b><span>{session?.synthetic === false ? "Real capture" : "Disclosed demonstration"} · Offline</span><ChevronDown size={14} /></summary>
+          <div className="disclosure-content">
             <b>Demonstration profile.</b> {disclosure} No measured real-world
             performance is claimed (Build Spec Section 29); unsupported targets
             report <span className="mono">not_supported</span>, never zero.
             {session?.data_disclosure ? <> <b>Active source:</b> {session.data_disclosure}</> : null}
-          </span>
-        </div>
+          </div>
+        </details>
 
         {view === "sessions" && (
           <SessionsView
@@ -232,8 +239,8 @@ export default function App() {
             sessions={sessions}
             onOpen={openSession}
             onSelect={selectSession}
-            loading={opening}
-            error={null}
+            loading={opening || catalogLoading}
+            error={sessionError}
           />
         )}
 
@@ -252,6 +259,7 @@ export default function App() {
 
         {view === "evidence" && session && (
           <EvidenceView
+            key={`${session.session_id}:${cutoffWindow}`}
             session={session}
             forecast={forecast}
             selectedEntity={selectedEntity ?? forecast?.entities[0]?.name ?? null}
@@ -262,6 +270,7 @@ export default function App() {
 
         {view === "replay" && session && (
           <ReplayView
+            key={`${session.session_id}:${cutoffWindow}`}
             session={session}
             forecast={forecast}
             cutoffWindow={cutoffWindow}

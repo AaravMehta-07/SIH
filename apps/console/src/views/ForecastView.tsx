@@ -5,6 +5,8 @@
 // the time axis of everything on screen.
 
 import { useMemo, useState } from "react";
+import { Search } from "lucide-react";
+import { CopyButton } from "../components/CopyButton";
 import type { ActionProposalPayload, ForecastPayload, SessionSummary, TrialPayload } from "../types";
 import { TASKS } from "../types";
 import { api } from "../api";
@@ -16,7 +18,6 @@ import {
   riskLevel,
   taskAt,
   taskColor,
-  useCountUp,
 } from "../components/charts";
 import { GraphView } from "../components/GraphView";
 
@@ -33,11 +34,11 @@ function riskColor(level: string): string {
   return "var(--ink-3)";
 }
 
-function occurrenceAt(entity: ForecastPayload["entities"][number], bins: number): number {
-  let max = 0;
+function occurrenceAt(entity: ForecastPayload["entities"][number], bins: number): number | null {
+  let max: number | null = null;
   for (const t of entity.tasks) {
-    if (t.cumulative_risk) {
-      max = Math.max(max, t.cumulative_risk[Math.min(bins, t.cumulative_risk.length) - 1]);
+    if (t.cumulative_risk?.[bins - 1] != null) {
+      max = Math.max(max ?? 0, t.cumulative_risk[bins - 1]);
     }
   }
   return max;
@@ -58,12 +59,12 @@ function EntityRow({
   const risk = occurrenceAt(entity, bins);
   const level = riskLevel(risk);
   const alerting = entity.tasks.some((t) => t.alerting);
-  const animated = useCountUp(risk);
   return (
     <button
       className={`entity-row ${selected ? "selected" : ""}`}
       onClick={() => onSelect(entity.name)}
       aria-current={selected ? "true" : undefined}
+      title={`${entity.name} · ${alerting ? "alerting" : risk == null ? "unavailable" : "no alert"}`}
     >
       <span
         className="state-marker"
@@ -72,22 +73,21 @@ function EntityRow({
           height: 8,
           borderRadius: "50%",
           background: alerting ? "var(--critical)" : riskColor(level),
-          boxShadow: alerting ? "0 0 7px rgba(208,59,59,.8)" : undefined,
         }}
         aria-hidden="true"
       />
       <span className="entity-id">
         <span className="entity-name">{entity.name.split(".")[0]}</span>
-        <span className="entity-role">{entity.role}</span>
+        <span className="entity-role">{alerting ? "Alerting · " : ""}{entity.role}</span>
       </span>
       <span className="entity-risk">
         <span className="risk-pct" style={{ color: riskColor(level) }}>
-          {(animated * 100).toFixed(1)}%
+          {risk == null ? "N/A" : pct(risk)}
         </span>
         <span className="risk-track" aria-hidden="true">
           <span
             className="risk-fill"
-            style={{ width: `${Math.max(risk * 100, 1.5)}%`, background: riskColor(level) }}
+            style={{ width: `${risk == null ? 0 : risk * 100}%`, background: riskColor(level) }}
           />
         </span>
       </span>
@@ -182,13 +182,13 @@ function Intervene({ forecast, session }: { forecast: ForecastPayload; session: 
           {error && <ErrorPanel message={error} />}
           <div className="intervene-step">1 · Select observed pair</div>
           <div style={{ display: "grid", gap: 6 }}>
-            <select className="pair-select" value={source} onChange={(e) => setSource(e.target.value)}>
+            <select aria-label="Internal action host" className="pair-select" value={source} onChange={(e) => { setSource(e.target.value); setTarget(""); setProposal(null); }}>
               <option value="">Internal host —</option>
-              {pairs.map((p) => (
-                <option key={p.internal} value={p.internal}>{p.internal}</option>
+              {[...new Set(pairs.map(p => p.internal))].map((name) => (
+                <option key={name} value={name}>{name}</option>
               ))}
             </select>
-            <select className="pair-select" value={target} onChange={(e) => setTarget(e.target.value)}>
+            <select aria-label="External action endpoint" className="pair-select" value={target} onChange={(e) => { setTarget(e.target.value); setProposal(null); }}>
               <option value="">External endpoint —</option>
               {pairs.filter((p) => !source || p.internal === source).map((p) => (
                 <option key={p.external} value={p.external}>{p.external}</option>
@@ -283,6 +283,7 @@ export function ForecastView({
   onCutoffChange: (cutoff: number) => void;
 }) {
   const [horizon, setHorizon] = useState(10);
+  const [search, setSearch] = useState("");
 
   const entity = useMemo(
     () => forecast?.entities.find((e) => e.name === selectedEntity) ?? null,
@@ -291,10 +292,10 @@ export function ForecastView({
 
   const sorted = useMemo(() => {
     if (!forecast) return [];
-    return [...forecast.entities].sort(
-      (a, b) => occurrenceAt(b, horizon) - occurrenceAt(a, horizon),
+    return forecast.entities.filter(e => `${e.name} ${e.role}`.toLowerCase().includes(search.toLowerCase())).sort(
+      (a, b) => (occurrenceAt(b, horizon) ?? -1) - (occurrenceAt(a, horizon) ?? -1),
     );
-  }, [forecast, horizon]);
+  }, [forecast, horizon, search]);
 
   const series = useMemo(() => {
     if (!entity) return [];
@@ -401,11 +402,12 @@ export function ForecastView({
           {/* ---- entities ------------------------------------------------ */}
           <div className="workspace-col">
             <div className="workspace-col-head">
-              <span>Entities</span>
+              <span>Entities / {forecast.entities.length}</span>
               <span style={{ letterSpacing: 0 }}>
                 {forecast.entities.filter((e) => e.tasks.some((t) => t.alerting)).length} alerting
               </span>
             </div>
+            <label className="search-field entity-filter"><Search size={13} /><input aria-label="Find entity" placeholder="Find entity" value={search} onChange={e => setSearch(e.target.value)} /></label>
             <div className="workspace-col-body">
               {sorted.map((e) => (
                 <EntityRow
@@ -416,6 +418,7 @@ export function ForecastView({
                   onSelect={onSelectEntity}
                 />
               ))}
+              {sorted.length === 0 && <div className="empty-state">No matching entities</div>}
             </div>
           </div>
 
@@ -475,7 +478,7 @@ export function ForecastView({
                     {entity.tasks.map((t) => {
                       const risk =
                         t.cumulative_risk
-                          ? t.cumulative_risk[Math.min(horizon, t.cumulative_risk.length) - 1]
+                          ? t.cumulative_risk[horizon - 1] ?? null
                           : null;
                       return (
                         <div
@@ -501,7 +504,7 @@ export function ForecastView({
                             className="task-risk"
                             style={{ color: risk != null ? riskColor(riskLevel(risk)) : undefined }}
                           >
-                            {risk == null ? "—" : pct(risk)}
+                            {risk == null ? t.status.replaceAll("_", " ") : pct(risk)}
                           </span>
                         </div>
                       );
@@ -553,12 +556,7 @@ export function ForecastView({
                       <div className="detail-label">Sealed forecast</div>
                       <div className="hash-chip" title={record.forecast_hash}>
                         <span>{record.forecast_hash.slice(0, 20)}…</span>
-                        <button
-                          onClick={() => navigator.clipboard?.writeText(record.forecast_hash)}
-                          aria-label="copy forecast hash"
-                        >
-                          copy
-                        </button>
+                        <CopyButton value={record.forecast_hash} />
                       </div>
                       <div className="metric-row" style={{ marginTop: 6 }}>
                         <span className="metric-key">Legal prefix</span>
@@ -569,7 +567,7 @@ export function ForecastView({
                     </div>
                   )}
 
-                  {session.synthetic && <Intervene forecast={forecast} session={session} />}
+                  {session.synthetic && <Intervene key={record?.forecast_hash} forecast={forecast} session={session} />}
                 </>
               ) : (
                 <div className="empty-state">

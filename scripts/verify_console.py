@@ -6,18 +6,20 @@ session -> forecast -> evidence -> reveal -> evaluation) plus edge cases
 (narrow viewport, long host names are inherent to the corpus).
 """
 
+import os
 import sys
 import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-BASE = "http://127.0.0.1:8031"
-OUT = Path(__file__).resolve().parents[1] / "artifacts" / "screens"
-OUT.mkdir(parents=True, exist_ok=True)
+BASE = os.environ.get("FORESIGHT_VERIFY_BASE", "http://127.0.0.1:8031")
+OUT = Path(os.environ.get("FORESIGHT_VERIFY_OUT",
+    Path(__file__).resolve().parents[1] / "reports" / "console"))
 
 
 def main() -> int:
+    OUT.mkdir(parents=True, exist_ok=True)
     errors: list[str] = []
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -72,7 +74,7 @@ def main() -> int:
         # 5b. Tier B: paths screen (supported after train_paths.py, else the
         # honest not_supported empty state — both must render cleanly)
         page.locator(".nav button", has_text="Paths").click()
-        page.wait_for_selector(".panel", timeout=30000)
+        page.wait_for_selector(".paths-list, .panel", timeout=30000)
         time.sleep(1.2)
         page.screenshot(path=str(OUT / "05b-paths.png"), full_page=False)
         supported = page.locator(".paths-list .path-row").count()
@@ -131,7 +133,7 @@ def main() -> int:
     print("\nconsole errors:", len(errors))
     for e in errors[:8]:
         print("  -", e[:160])
-    return 1 if errors else 0
+    return 1 if errors or overflow else 0
 
 
 if __name__ == "__main__":

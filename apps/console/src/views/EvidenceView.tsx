@@ -69,10 +69,7 @@ export function EvidenceView({
         <div>
           <h1>Evidence</h1>
           <p className="sub">
-            Deletion-tested attribution: remove one prefix window of the
-            entity's traffic, recompute features, rerun the model — the score
-            delta is the evidence. Fidelity is measured against matched-size
-            random deletion (K.1). Deltas are sensitivity, not causal effects.
+            Source-linked traffic and measured attribution. Deletion deltas are sensitivity, not causal effects.
           </p>
         </div>
         {tab === "attribution" && (
