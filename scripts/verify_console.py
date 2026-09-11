@@ -37,6 +37,9 @@ def main() -> int:
         card.locator("button", has_text="Open session").click()
         page.wait_for_selector(".panel", timeout=60000)
         page.wait_for_selector(".tiles", timeout=60000)
+        # the entity table fills when the forecast payload lands (the first
+        # forecast on a cold server can outlive any fixed sleep)
+        page.wait_for_selector("table.data tbody tr", timeout=120000)
         page.wait_for_timeout(1500)
         page.screenshot(path=str(OUT / "02-forecast.png"))
         print("forecast: entities rows =", page.locator("table.data tbody tr").count())
@@ -65,6 +68,49 @@ def main() -> int:
         time.sleep(0.8)
         page.screenshot(path=str(OUT / "05-evaluation.png"), full_page=False)
         print("evaluation: golden check visible")
+
+        # 5b. Tier B: paths screen (supported after train_paths.py, else the
+        # honest not_supported empty state — both must render cleanly)
+        page.locator(".nav button", has_text="Paths").click()
+        page.wait_for_selector(".panel", timeout=30000)
+        time.sleep(1.2)
+        page.screenshot(path=str(OUT / "05b-paths.png"), full_page=False)
+        supported = page.locator(".paths-list .path-row").count()
+        print("paths: ranked path rows =", supported)
+
+        # 5c. Tier B: evidence query screen (Section 21)
+        page.locator(".nav button", has_text="Query").click()
+        page.wait_for_selector(".tile", timeout=30000)
+        time.sleep(1.0)
+        page.screenshot(path=str(OUT / "05c-query.png"), full_page=False)
+        proposals = page.locator(".query-row").count()
+        print("query: proposal rows =", proposals)
+        # execute the first proposal when present (answered/unavailable/
+        # denied states must all render without console errors)
+        if proposals:
+            page.locator(".query-row button", has_text="Request").first.click()
+            page.wait_for_selector(".query-answer", timeout=30000)
+            time.sleep(0.8)
+            page.screenshot(path=str(OUT / "05c-query-answered.png"), full_page=False)
+            print("query: answer rendered =", page.locator(".query-answer").count())
+
+        # 5d. Tier B: range action screen (Sections 22-23) — propose,
+        # authorize, dry-run the paired trial
+        page.locator(".nav button", has_text="Action").click()
+        page.wait_for_selector(".action-select", timeout=30000)
+        page.locator(".action-select").first.select_option(index=1)
+        page.locator(".action-select").nth(1).select_option(index=1)
+        page.locator("button", has_text="Propose action").click()
+        page.wait_for_selector("text=Authorize", timeout=30000)
+        time.sleep(0.6)
+        page.screenshot(path=str(OUT / "05d-action-proposal.png"), full_page=False)
+        page.locator("button", has_text="Authorize").click()
+        page.wait_for_selector("text=Dry-run paired trial", timeout=30000)
+        page.locator("button", has_text="Dry-run paired trial").click()
+        page.wait_for_selector("text=Paired trial outcome", timeout=120000)
+        time.sleep(1.0)
+        page.screenshot(path=str(OUT / "05d-action-trial.png"), full_page=False)
+        print("action: trial outcome rendered")
 
         # 6. narrow viewport (K.3)
         page.set_viewport_size({"width": 420, "height": 900})

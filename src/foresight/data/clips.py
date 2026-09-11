@@ -76,8 +76,14 @@ class EpisodePrecomputed:
     prefix_windows: dict[int, list[RawGraphWindow]]  # cutoff window -> 20 raw
 
 
-def precompute_episode(episode: Episode) -> EpisodePrecomputed:
-    """Build all raw windows (full-info + per-cutoff prefixes) once."""
+def precompute_episode(episode: Episode, *, stride: int = CUTOFF_STEP) -> EpisodePrecomputed:
+    """Build all raw windows (full-info + per-cutoff prefixes) once.
+
+    ``stride`` selects the cutoff grid for the prefix windows; it must match
+    the stride the caller will serve/evaluate at (a stride-10 prefix does
+    not exist on the stride-8 grid — the grids only share cutoffs 20 and
+    60).
+    """
     capture = episode.capture
     entity_ids = episode.internal_entity_ids()
     n = len(entity_ids)
@@ -116,7 +122,7 @@ def precompute_episode(episode: Episode) -> EpisodePrecomputed:
     )
 
     prefix: dict[int, list[RawGraphWindow]] = {}
-    for cutoff_window in sample_cutoffs(episode):
+    for cutoff_window in sample_cutoffs(episode, stride=stride):
         cutoff_ns = cutoff_window * WINDOW_NS
         prefix[cutoff_window] = build_clip_windows(
             table,
@@ -237,9 +243,10 @@ class ClipDataset:
 
     def _load_or_build(self, episode: Episode) -> list[ClipExample]:
         cache = self._cache_path(episode)
+        active_stride = self.stride or CUTOFF_STEP
         wanted = set(
             sample_cutoffs(
-                episode, horizon=self.horizon, stride=self.stride or CUTOFF_STEP
+                episode, horizon=self.horizon, stride=active_stride
             )
         )
         if cache is not None and cache.exists():
@@ -251,13 +258,18 @@ class ClipDataset:
                     for ex in pickle.load(handle)
                     if ex.cutoff_window in wanted
                 ]
-        pre = precompute_episode(episode)
+        # Fresh caches are built on the ACTIVE stride's grid: the stride-8
+        # and stride-10 grids share only cutoffs 20 and 60, so building on
+        # the default grid would silently drop eval cutoffs.
+        pre = precompute_episode(episode, stride=active_stride)
         examples = [
             build_clip_example(
                 episode, pre, cutoff, self.scaler,
                 split=self.split, horizon=self.horizon,
             )
-            for cutoff in sample_cutoffs(episode, horizon=self.horizon)
+            for cutoff in sample_cutoffs(
+                episode, horizon=self.horizon, stride=active_stride
+            )
         ]
         if cache is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)

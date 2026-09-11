@@ -68,6 +68,7 @@ from foresight.models.survival import (  # noqa: E402
     hazards_from_logits,
 )
 from foresight.models.types import CandidatePairs, GraphWindowBatch  # noqa: E402
+from foresight.models.variants import build_world_model, variant_of  # noqa: E402
 from foresight.models.world_model import ForesightWorldModel  # noqa: E402
 from foresight.runtime.forecast import (  # noqa: E402
     EnsembleForecaster,
@@ -80,9 +81,58 @@ from foresight.training.trainer import CurriculumSchedule, Trainer, set_seed  # 
 
 PRIMARY_HORIZON = 10
 SEEDS = (0, 1, 2, 3, 4)
+#: I.5 heterogeneous ensemble: the Tier B profile trains the Section-13
+#: reference plus two architecturally distinct members (models/variants.py).
+#: Reference checkpoints from the original 5-seed run are reused (same
+#: interface, same corpus); gate/wide are trained fresh.
+DEFAULT_MEMBERS = "reference:0,1,2,3,4 gate:0,1 wide:0,1"
 CURRICULUM_TRANSITIONS = (9, 17, 25, 33)  # epochs at which horizon advances
 EARLY_STOP_PATIENCE = 8
+#: Early stop may only fire once the curriculum reaches the PRIMARY horizon
+#: (h=10 begins at epoch 17): dev AP at h=1/h=3 sits in the same 0.008-0.04
+#: band for every member family (reference seeds included — see
+#: training_run.json) and an epoch-2 spike there exhausts patience before
+#: the metric means anything. Patience also resets at each horizon
+#: transition, so every phase gets a fresh budget.
+PRIMARY_HORIZON_EPOCH = 17
 FALSE_ALERT_BUDGET_PER_100_ASSET_HOURS = 1.0
+
+
+def parse_members(spec: str) -> list[tuple[str, int]]:
+    """Parse a member plan like ``reference:0,1,2 gate:0,1 wide:0``."""
+    members: list[tuple[str, int]] = []
+    for group in spec.split():
+        variant, _, seed_list = group.partition(":")
+        variant = variant.strip()
+        if variant not in ("reference", "gate", "wide"):
+            raise ValueError(f"unknown variant {variant!r} in member plan")
+        for part in seed_list.split(","):
+            part = part.strip()
+            if "-" in part:
+                lo, hi = part.split("-")
+                seeds = range(int(lo), int(hi) + 1)
+            else:
+                seeds = [int(part)]
+            for s in seeds:
+                members.append((variant, s))
+    if not members:
+        raise ValueError("member plan is empty")
+    return members
+
+
+def member_checkpoint(partial_dir: Path, variant: str, seed: int) -> Path:
+    """Checkpoint path for one member. Reference members fall back to the
+    legacy ``seed{N}.pt`` name from the original 5-seed run."""
+    new = partial_dir / f"{variant}_seed{seed}.pt"
+    if variant == "reference" and not new.exists():
+        legacy = partial_dir / f"seed{seed}.pt"
+        if legacy.exists():
+            return legacy
+    return new
+
+
+def member_model_path(bundle_dir: Path, variant: str, seed: int) -> Path:
+    return bundle_dir / f"model_{variant}_seed{seed}.safetensors"
 
 #: Section-15 sanctioned oversampling: clips with imminent primary-horizon
 #: events are sampled 4x more often; the sampling policy is recorded in the
@@ -410,9 +460,20 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=REPO_ROOT / "artifacts" / "profile")
     parser.add_argument("--cache", type=Path, default=REPO_ROOT / "artifacts" / "cache")
     parser.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
+    parser.add_argument(
+        "--members",
+        type=str,
+        default=DEFAULT_MEMBERS,
+        help=(
+            "member plan: 'variant:seeds' groups, e.g. "
+            "'reference:0,1,2,3,4 gate:0,1 wide:0,1' (I.5)"
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
+
+    plan = parse_members(args.members)
 
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -487,34 +548,42 @@ def main() -> None:
 
     partial_dir = args.out / "partial"
     partial_dir.mkdir(parents=True, exist_ok=True)
-    members: dict[int, OrderedDict] = {}
-    run_summaries: dict[int, dict] = {}
-    for seed in args.seeds:
-        checkpoint = partial_dir / f"seed{seed}.pt"
+    members: dict[tuple[str, int], OrderedDict] = {}
+    run_summaries: dict[str, dict] = {}
+    # Variant seed offsets decorrelate member initialization across families
+    # sharing seed numbers (I.5: independently trained members).
+    variant_seed_offset = {"reference": 0, "gate": 10_000, "wide": 20_000}
+    for variant, seed in plan:
+        member_key = f"{variant}:{seed}"
+        checkpoint = member_checkpoint(partial_dir, variant, seed)
         resume = None
         if checkpoint.exists():
             resume = torch.load(checkpoint, map_location="cpu", weights_only=False)
             summary = resume["summary"]
             if resume.get("final", False):
-                members[seed] = resume["state"]
-                run_summaries[seed] = summary
+                members[(variant, seed)] = resume["state"]
+                run_summaries[member_key] = summary
                 print(
-                    f"[4/8] seed={seed}: checkpoint found (best epoch "
+                    f"[4/8] {member_key}: checkpoint found (best epoch "
                     f"{summary['best_epoch']}, devAP "
                     f"{summary['best_dev_mean_ap']:.3f}) - skipping",
                     flush=True,
                 )
                 continue
             print(
-                f"[4/8] seed={seed}: resuming from epoch "
+                f"[4/8] {member_key}: resuming from epoch "
                 f"{summary['epochs'][-1]['epoch']} (best "
                 f"{summary['best_epoch']}, devAP "
                 f"{summary['best_dev_mean_ap']:.3f})",
                 flush=True,
             )
-        print(f"[4/8] training member seed={seed}...", flush=True)
-        set_seed(seed)
-        model = ForesightWorldModel.from_config(config, num_event_tasks=5).to(device)
+        print(f"[4/8] training member {member_key}...", flush=True)
+        set_seed(seed + variant_seed_offset[variant])
+        model = build_world_model(config, variant=variant, num_event_tasks=5).to(
+            device
+        )
+        if variant_of(model) == "custom":
+            raise RuntimeError(f"variant assembly failed for {member_key}")
         if resume is not None:
             model.load_state_dict(
                 {k: v.to(device) for k, v in resume["state"].items()}
@@ -579,6 +648,13 @@ def main() -> None:
             start_epoch = 1
         for epoch in range(start_epoch, args.epochs + 1):
             horizon = trainer.curriculum.horizon_for_epoch(epoch)
+            if epoch == start_epoch:
+                prev_horizon = horizon
+            elif horizon != prev_horizon:
+                # Fresh patience per curriculum phase: the dev-AP metric
+                # changes meaning at every horizon advance.
+                epochs_no_improve = 0
+                prev_horizon = horizon
             order = list(
                 np.random.default_rng(seed * 1000 + epoch).choice(
                     len(train_examples),
@@ -654,11 +730,15 @@ def main() -> None:
                 f"{marker} ({time.time() - t_epoch:.0f}s)",
                 flush=True,
             )
-            if epochs_no_improve >= EARLY_STOP_PATIENCE:
+            if (
+                epochs_no_improve >= EARLY_STOP_PATIENCE
+                and epoch >= PRIMARY_HORIZON_EPOCH
+            ):
                 print(f"  early stop at epoch {epoch} (best {best_epoch})", flush=True)
                 break
-        members[seed] = best_state
-        run_summaries[seed] = {
+        members[(variant, seed)] = best_state
+        run_summaries[member_key] = {
+            "variant": variant,
             "best_epoch": best_epoch,
             "best_dev_mean_ap": best_ap,
             "curriculum_transitions": list(CURRICULUM_TRANSITIONS),
@@ -670,16 +750,19 @@ def main() -> None:
             ),
             "epochs": epoch_logs,
         }
-        # Final checkpoint for this seed: complete, do not resume into it.
+        # Final checkpoint for this member: complete, do not resume into it.
         torch.save(
             {
                 "state": best_state,
-                "summary": run_summaries[seed],
+                "summary": run_summaries[member_key],
                 "final": True,
             },
-            checkpoint,
+            member_checkpoint(partial_dir, variant, seed),
         )
-        print(f"  checkpoint saved: {checkpoint}", flush=True)
+        print(
+            f"  checkpoint saved: {member_checkpoint(partial_dir, variant, seed)}",
+            flush=True,
+        )
         del model, trainer
         gc.collect()
         if device.type == "cuda":
@@ -690,16 +773,18 @@ def main() -> None:
     del dev_monitor
     gc.collect()
 
-    # Sequential-seed mode: when other seeds' checkpoints are still pending,
-    # exit here — the final invocation (all checkpoints present) assembles
-    # calibrators, policy, predictions and the bundle.
+    # Sequential-member mode: when other members' checkpoints are still
+    # pending, exit here — the final invocation (all checkpoints present)
+    # assembles calibrators, policy, predictions and the bundle.
     pending = [
-        s for s in SEEDS if not (partial_dir / f"seed{s}.pt").exists()
+        f"{v}:{s}"
+        for v, s in plan
+        if not member_checkpoint(partial_dir, v, s).exists()
     ]
     if pending:
         print(
-            f"[resume] pending seeds {pending}; exiting after training stage "
-            "(re-run per seed; the final run assembles the bundle)",
+            f"[resume] pending members {pending}; exiting after training stage "
+            "(re-run per member; the final run assembles the bundle)",
             flush=True,
         )
         return
@@ -716,22 +801,45 @@ def main() -> None:
     )
     engines: list[ForecastEngine] = []
     calibrators_payload: dict[str, dict] = {}
-    for seed in args.seeds:
-        model = ForesightWorldModel.from_config(config, num_event_tasks=5).to(device)
-        model.load_state_dict({k: v.to(device) for k, v in members[seed].items()})
+    # Legacy calibrators from the reference-only profile are keyed
+    # "{seed}:{task}"; remap to the member-qualified form instead of
+    # refitting (same weights, same calibration split).
+    legacy_calibrators: dict[str, dict] = {}
+    legacy_path = args.out / "calibrators.json"
+    if legacy_path.exists():
+        try:
+            raw = json.loads(legacy_path.read_text(encoding="utf-8"))
+            legacy_calibrators = {
+                k: v for k, v in raw.items() if k.count(":") == 1
+            }
+        except (ValueError, OSError):
+            legacy_calibrators = {}
+    for variant, seed in plan:
+        model = build_world_model(config, variant=variant, num_event_tasks=5).to(
+            device
+        )
+        model.load_state_dict(
+            {k: v.to(device) for k, v in members[(variant, seed)].items()}
+        )
         model.eval()
         engines.append(ForecastEngine(model))
     # gather per-member logits once
-    member_logits: dict[int, dict[int, tuple]] = {}
-    for si, engine in enumerate(engines):
+    member_logits: dict[str, dict[int, tuple]] = {}
+    for mi, engine in enumerate(engines):
+        variant, seed = plan[mi]
         _, merged = collect_cal_records([engine], device, examples["calibration"])
-        member_logits[args.seeds[si]] = merged
-    for seed, merged in member_logits.items():
-        for task, (logits, events, masks) in merged.items():
+        member_logits[f"{variant}:{seed}"] = merged
+    for mi, (variant, seed) in enumerate(plan):
+        member_key = f"{variant}:{seed}"
+        for task, (logits, events, masks) in member_logits[member_key].items():
+            legacy = legacy_calibrators.get(f"{seed}:{task}") if variant == "reference" else None
+            if legacy is not None:
+                calibrators_payload[f"{member_key}:{task}"] = legacy
+                continue
             cal = fit_hazard_calibrator(logits, events, masks, task_index=task)
-            calibrators_payload[f"{seed}:{task}"] = cal.to_dict()
+            calibrators_payload[f"{member_key}:{task}"] = cal.to_dict()
             print(
-                f"  seed {seed} task {task}: fitted={cal.fitted} "
+                f"  {member_key} task {task}: fitted={cal.fitted} "
                 f"slope={cal.slope:.3f} events={cal.fit_event_count}",
                 flush=True,
             )
@@ -739,14 +847,15 @@ def main() -> None:
     from foresight.calibration.hazard import HazardCalibrator
 
     calibrated_engines: list[ForecastEngine] = []
-    for si, seed in enumerate(args.seeds):
+    for mi, (variant, seed) in enumerate(plan):
+        member_key = f"{variant}:{seed}"
         cals = {
-            (int(k.split(":")[1]), None): HazardCalibrator.from_dict(v)
+            (int(k.split(":")[2]), None): HazardCalibrator.from_dict(v)
             for k, v in calibrators_payload.items()
-            if int(k.split(":")[0]) == seed
+            if k.startswith(f"{member_key}:")
         }
-        engines[si].calibrator_set = CalibratorSet(calibrators=cals, pooled=None)
-        calibrated_engines.append(engines[si])
+        engines[mi].calibrator_set = CalibratorSet(calibrators=cals, pooled=None)
+        calibrated_engines.append(engines[mi])
 
     # ---- 6. selection policy ---------------------------------------------------
     print("[6/8] fitting selection policy at the alert budget...", flush=True)
@@ -808,18 +917,22 @@ def main() -> None:
             f"{novelty.fit_residual_count} matured residuals",
             flush=True,
         )
-    for seed in args.seeds:
-        path = bundle / f"model_seed{seed}.safetensors"
+    for variant, seed in plan:
+        path = member_model_path(bundle, variant, seed)
         from safetensors.torch import save_file
 
-        save_file(members[seed], str(path))
+        save_file(members[(variant, seed)], str(path))
     (bundle / "manifest.json").write_text(
         json.dumps(
             {
                 "schema": "foresight.core.2026-09",
-                "profile": "foresight-section35-run",
+                "profile": "foresight-section35-tierb-ensemble",
                 "synthetic_data_only": True,
-                "seeds": list(args.seeds),
+                "seeds": [s for v, s in plan if v == "reference"],
+                "members": [
+                    {"variant": v, "seed": s} for v, s in plan
+                ],
+                "ensemble": "I.5 heterogeneous (reference + gate + wide)",
                 "corpus": {
                     "episodes": len(episodes),
                     "splits": splits.manifest(),

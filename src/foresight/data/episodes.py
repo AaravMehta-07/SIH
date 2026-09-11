@@ -45,6 +45,24 @@ class StageWindow:
 class CampaignOutcome:
     ground_truth: list[GroundTruth] = field(default_factory=list)
     stages: list[StageWindow] = field(default_factory=list)
+    #: Typed-event attack chain (Section 20 / N.2 training sequences). Each
+    #: step is the disclosed ground truth for one scripted behavior: the task
+    #: (event type), source and target entities and the scheduled time. This
+    #: is label-side information — the forecast pipeline never reads it; the
+    #: Tier B path model and the range simulator consume it for training and
+    #: paired trials only.
+    chain: list["ChainStep"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ChainStep:
+    """One typed event of a campaign chain: (task, source, target, time)."""
+
+    task_index: int
+    source: str
+    target: str
+    time_ns: int
+    label_tier: str = "confirmed"
 
 
 # --------------------------------------------------------------------------
@@ -178,6 +196,8 @@ def campaign_web_to_lateral(b: CaptureBuilder) -> CampaignOutcome:
     out.ground_truth.append(
         GroundTruth("web-01.dmz.local", 1, t0 + 30_000_000, "confirmed"))
     out.stages.append(StageWindow("web-01.dmz.local", 1, t0, t0 + 3 * MIN))
+    out.chain.append(ChainStep(0, "ext-attacker-01.net", "web-01.dmz.local", t0, "weak_proxy"))
+    out.chain.append(ChainStep(1, "ext-attacker-01.net", "web-01.dmz.local", t0 + 30_000_000))
 
     # Stage 2: C2 beacon from the web server.
     b.beacon(t0 + 2 * MIN, "web-01.dmz.local", "ext-c2-01.net",
@@ -187,6 +207,7 @@ def campaign_web_to_lateral(b: CaptureBuilder) -> CampaignOutcome:
         GroundTruth("web-01.dmz.local", 3, t0 + 2 * MIN, "confirmed"))
     out.stages.append(
         StageWindow("web-01.dmz.local", 3, t0 + 2 * MIN, EPISODE_DURATION_NS))
+    out.chain.append(ChainStep(3, "web-01.dmz.local", "ext-c2-01.net", t0 + 2 * MIN))
 
     # Stage 3: reconnaissance — sequential port scan of the app tier.
     scan_t = t0 + 6 * MIN
@@ -205,6 +226,7 @@ def campaign_web_to_lateral(b: CaptureBuilder) -> CampaignOutcome:
         GroundTruth("srv-app-02.corp.local", 2, lat1 + 20_000_000, "confirmed"))
     out.stages.append(
         StageWindow("srv-app-02.corp.local", 2, lat1, lat1 + 4 * MIN))
+    out.chain.append(ChainStep(2, "web-01.dmz.local", "srv-app-02.corp.local", lat1 + 20_000_000))
 
     # Stage 5: second hop to the database.
     lat2 = t0 + 13 * MIN
@@ -214,6 +236,7 @@ def campaign_web_to_lateral(b: CaptureBuilder) -> CampaignOutcome:
         GroundTruth("db-01.corp.local", 2, lat2 + 20_000_000, "confirmed"))
     out.stages.append(
         StageWindow("db-01.corp.local", 2, lat2, lat2 + 4 * MIN))
+    out.chain.append(ChainStep(2, "srv-app-02.corp.local", "db-01.corp.local", lat2 + 20_000_000))
 
     # Stage 6: second C2 channel from the app server.
     c2b = t0 + 16 * MIN
@@ -224,6 +247,7 @@ def campaign_web_to_lateral(b: CaptureBuilder) -> CampaignOutcome:
         GroundTruth("srv-app-02.corp.local", 3, c2b, "confirmed"))
     out.stages.append(
         StageWindow("srv-app-02.corp.local", 3, c2b, EPISODE_DURATION_NS))
+    out.chain.append(ChainStep(3, "srv-app-02.corp.local", "ext-c2-01.net", c2b))
     return out
 
 
@@ -245,6 +269,8 @@ def campaign_c2_exfil(b: CaptureBuilder) -> CampaignOutcome:
         GroundTruth("ws-41.corp.local", 3, t0 + 60_000_000, "confirmed"))
     out.stages.append(
         StageWindow("ws-41.corp.local", 3, t0, EPISODE_DURATION_NS))
+    out.chain.append(ChainStep(0, "ext-c2-01.net", "ws-41.corp.local", t0, "weak_proxy"))
+    out.chain.append(ChainStep(3, "ws-41.corp.local", "ext-c2-01.net", t0 + 60_000_000))
 
     lat = t0 + 5 * MIN
     b.lateral_session(lat, "ws-41.corp.local", "file-01.corp.local")
@@ -252,6 +278,7 @@ def campaign_c2_exfil(b: CaptureBuilder) -> CampaignOutcome:
         GroundTruth("file-01.corp.local", 2, lat + 20_000_000, "confirmed"))
     out.stages.append(
         StageWindow("file-01.corp.local", 2, lat, lat + 4 * MIN))
+    out.chain.append(ChainStep(2, "ws-41.corp.local", "file-01.corp.local", lat + 20_000_000))
 
     # Staging: archives copied from the file server into the database.
     stage_t = t0 + 8 * MIN
@@ -267,6 +294,7 @@ def campaign_c2_exfil(b: CaptureBuilder) -> CampaignOutcome:
         GroundTruth("db-01.corp.local", 4, exfil_t + 60_000_000, "confirmed"))
     out.stages.append(
         StageWindow("db-01.corp.local", 4, exfil_t, exfil_t + 8 * MIN))
+    out.chain.append(ChainStep(4, "db-01.corp.local", "ext-c2-01.net", exfil_t + 60_000_000))
     return out
 
 
@@ -287,6 +315,8 @@ def campaign_slow_recon(b: CaptureBuilder) -> CampaignOutcome:
         GroundTruth("ws-12.corp.local", 3, t0 + 60_000_000, "confirmed"))
     out.stages.append(
         StageWindow("ws-12.corp.local", 3, t0, EPISODE_DURATION_NS))
+    out.chain.append(ChainStep(0, "ext-c2-01.net", "ws-12.corp.local", t0, "weak_proxy"))
+    out.chain.append(ChainStep(3, "ws-12.corp.local", "ext-c2-01.net", t0 + 60_000_000))
 
     scan_t = t0 + 4 * MIN
     b.port_scan(scan_t, "ws-12.corp.local", "srv-app-01.corp.local",
@@ -300,6 +330,7 @@ def campaign_slow_recon(b: CaptureBuilder) -> CampaignOutcome:
         GroundTruth("srv-app-01.corp.local", 2, lat + 20_000_000, "confirmed"))
     out.stages.append(
         StageWindow("srv-app-01.corp.local", 2, lat, lat + 4 * MIN))
+    out.chain.append(ChainStep(2, "ws-12.corp.local", "srv-app-01.corp.local", lat + 20_000_000))
     return out
 
 
@@ -321,6 +352,8 @@ def campaign_cred_spray(b: CaptureBuilder) -> CampaignOutcome:
         GroundTruth("ws-21.corp.local", 3, t0 + 60_000_000, "confirmed"))
     out.stages.append(
         StageWindow("ws-21.corp.local", 3, t0, EPISODE_DURATION_NS))
+    out.chain.append(ChainStep(0, "ext-c2-01.net", "ws-21.corp.local", t0, "weak_proxy"))
+    out.chain.append(ChainStep(3, "ws-21.corp.local", "ext-c2-01.net", t0 + 60_000_000))
 
     # Credential spray: many short SMB attempts, mostly denied.
     spray_t = t0 + 3 * MIN
@@ -342,6 +375,7 @@ def campaign_cred_spray(b: CaptureBuilder) -> CampaignOutcome:
         GroundTruth("file-01.corp.local", 2, lat + 20_000_000, "confirmed"))
     out.stages.append(
         StageWindow("file-01.corp.local", 2, lat, lat + 4 * MIN))
+    out.chain.append(ChainStep(2, "ws-21.corp.local", "file-01.corp.local", lat + 20_000_000))
     return out
 
 
@@ -379,6 +413,7 @@ class Episode:
     start_ns: int
     end_ns: int
     duration_ns: int
+    chain: tuple[ChainStep, ...] = ()
 
     @property
     def ground_truth(self) -> tuple[GroundTruth, ...]:
@@ -429,6 +464,7 @@ def build_episode(campaign: str, index: int, *, seed: int | None = None,
         start_ns=0,
         end_ns=EPISODE_DURATION_NS,
         duration_ns=EPISODE_DURATION_NS,
+        chain=tuple(outcome.chain),
     )
 
 

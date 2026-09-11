@@ -39,6 +39,9 @@ def main() -> int:
             "button", has_text="Open session"
         ).click()
         page.wait_for_selector(".tiles", timeout=60000)
+        # the forecast payload must land before chart marks exist (the first
+        # forecast on a cold server can outlive any fixed sleep)
+        page.wait_for_selector("table.data tbody tr", timeout=120000)
         time.sleep(1.2)
 
         # Chart rendered with marks

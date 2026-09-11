@@ -26,6 +26,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import SCHEMA_ID
+from ..actions import (
+    ACTION_POLICY,
+    ActionStateMachine,
+    IllegalTransitionError,
+)
 from ..contracts.objects import full_packet_capability
 from ..data.episodes import build_episode
 from ..labels.ontology import SIH_TACTICS, TASK_DEFINITIONS
@@ -143,7 +148,12 @@ def health() -> dict:
         "schema": SCHEMA_ID,
         "weights_profile": weights_profile,
         "sessions": len(_sessions),
-        "action_mode": "disabled",
+        "action_mode": "demo_range",
+        "tier_b": {
+            "paths": "supported" if getattr(get_bundle(), "path_engine", None) else "not_supported",
+            "queries": "supported",
+            "actions": "demo_range",
+        },
         "offline": True,
     }
 
@@ -389,31 +399,200 @@ def evaluation() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Tier B: evidence queries (Section 21) and range actions (Sections 22-23)
+# ---------------------------------------------------------------------------
+
+class QueryProposeBody(BaseModel):
+    session_id: str
+    cutoff_window: int
+
+
+class QueryExecuteBody(BaseModel):
+    session_id: str
+    cutoff_window: int
+
+
 @app.post("/v1/queries")
-def queries(body: dict) -> dict:
-    """Tier B evidence acquisition is not implemented: typed disabled result
-    (L.2 - a successful typed response, never a misleading crash)."""
+def queries(body: QueryProposeBody) -> dict:
+    """Tier B evidence requests: transparent-rule proposals from the
+    committed forecast (Section 21 default stretch policy)."""
+    session = _session_or_404(body.session_id)
+    try:
+        return session.propose_queries(body.cutoff_window)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+
+
+@app.post("/v1/queries/{proposal_id}/execute")
+def query_execute(proposal_id: str, body: QueryExecuteBody) -> dict:
+    """Execute one allowlisted request: answered / unavailable / denied /
+    expired — never an invented observation (N.3)."""
+    session = _session_or_404(body.session_id)
+    try:
+        return session.execute_query(proposal_id, body.cutoff_window)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+
+
+# -- actions (synthetic range only, disclosed) ------------------------------
+
+class ActionProposeBody(BaseModel):
+    session_id: str
+    cutoff_window: int
+    source: str
+    target: str
+
+
+class ActionAuthorizeBody(BaseModel):
+    signature: str | None = None  # demo: the analyst's explicit console click
+
+
+class ActionExecuteBody(BaseModel):
+    dry_run: bool = True
+
+
+_actions: dict[str, "ActionStateMachine"] = {}
+
+
+@app.get("/v1/actions")
+def actions_status() -> dict:
+    """Action plane status + reconciler pass (Section 23: TTL and recovery
+    enforced even if the planner or UI crashed)."""
+    for machine in _actions.values():
+        machine.reconcile()
     return {
-        "status": "not_supported",
-        "reason": (
-            "Tier B evidence-request queries are disabled in the core "
-            "profile (Build Spec Section 21, Appendix N; T.3)"
+        "mode": "demo_range",
+        "disclosure": (
+            "execution happens in the disclosed synthetic range only; no "
+            "real-world control effect is claimed (Sections 2, 22-23)"
         ),
-        "request": body,
+        "policy": ACTION_POLICY,
+        "actions": [m.to_json() for m in _actions.values()],
     }
 
 
 @app.post("/v1/actions/propose")
-def actions_propose(body: dict) -> dict:
-    """Action authority is a separate control plane, disabled offline (Section 23)."""
-    return {
-        "status": "not_supported",
-        "reason": (
-            "action_mode is disabled in the offline core profile; FORESIGHT "
-            "issues forecasts and evidence only (Build Spec Section 3, 23)"
-        ),
-        "request": body,
+def actions_propose(body: ActionProposeBody) -> dict:
+    """Propose one block_edge action bound to the committed forecast at the
+    cutoff; policy failures are reported, never silently coerced."""
+    from ..actions import new_proposal, check_policy
+
+    session = _session_or_404(body.session_id)
+    payload = session.forecast_cache.get(body.cutoff_window)
+    if payload is None:
+        raise HTTPException(
+            409,
+            "run the forecast at this cutoff before proposing an action",
+        )
+    record = payload.get("record") or {}
+    # Observed pairs for the scope check: eligible-prefix telemetry, both
+    # directions, including cross-boundary (internal<->external) pairs —
+    # graph edges are internal-only (G.2).
+    graph = payload.get("graph", {})
+    observed = {
+        (e["source"], e["target"])
+        for e in graph.get("observed_edges", [])
+    } | {
+        (e["source"], e["target"])
+        for e in graph.get("external_edges", [])
     }
+    observed |= {(b, a) for (a, b) in observed}
+    failures = check_policy(
+        action_type="block_edge",
+        source=body.source,
+        target=body.target,
+        forecast_id=record.get("forecast_id", ""),
+        forecast_hash=record.get("forecast_hash", ""),
+        observed_pairs=sorted(observed),
+    )
+    disagreement = None
+    for entity in payload.get("entities", []):
+        if entity["name"] in (body.source, body.target):
+            for task in entity.get("tasks", []):
+                if task.get("task_index") == 2:
+                    disagreement = task.get("disagreement")
+    proposal = new_proposal(
+        source=body.source,
+        target=body.target,
+        forecast_id=record.get("forecast_id", ""),
+        forecast_hash=record.get("forecast_hash", ""),
+        cutoff_window=body.cutoff_window,
+        session_id=body.session_id,
+        uncertainty=(
+            {"ensemble_disagreement_lateral": disagreement}
+            if disagreement is not None
+            else {}
+        ),
+    )
+    machine = ActionStateMachine(proposal, policy_failures=failures)
+    _actions[proposal.action_id] = machine
+    return machine.to_json()
+
+
+@app.post("/v1/actions/{action_id}/authorize")
+def actions_authorize(action_id: str, body: ActionAuthorizeBody) -> dict:
+    """Explicit human authorization. In the demo the console click produces
+    the HMAC signature (disclosed demo key, Section 23 signed-approval
+    contract); production authorization is a separate service."""
+    from ..actions import sign_approval
+
+    machine = _actions.get(action_id)
+    if machine is None:
+        raise HTTPException(404, "unknown action")
+    signature = body.signature or sign_approval(machine.proposal)
+    try:
+        machine.authorize(signature)
+    except IllegalTransitionError as exc:
+        raise HTTPException(409, str(exc)) from None
+    return machine.to_json()
+
+
+@app.post("/v1/actions/{action_id}/execute")
+def actions_execute(action_id: str, body: ActionExecuteBody) -> dict:
+    """Execute once in the synthetic range: a paired no-action/action trial
+    from the same cutoff, same seed (Section 22). Dry-run is the default
+    (kill switch); outcomes are audit-logged with verified postconditions."""
+    from ..actions import paired_trial
+
+    machine = _actions.get(action_id)
+    if machine is None:
+        raise HTTPException(404, "unknown action")
+    try:
+        machine.begin_execution()
+    except IllegalTransitionError as exc:
+        raise HTTPException(409, str(exc)) from None
+    proposal = machine.proposal
+    session = _sessions.get(proposal.session_id)
+    if session is None or not session.record_ids.get(proposal.cutoff_window):
+        machine.complete("failed", {"reason": "bound session no longer available"})
+        raise HTTPException(409, "the bound session is no longer available")
+    try:
+        trial = paired_trial(
+            session.episode,
+            proposal.cutoff_window,
+            source=proposal.source,
+            target=proposal.target,
+        )
+    except ValueError as exc:
+        machine.complete("failed", {"reason": str(exc)})
+        raise HTTPException(422, str(exc)) from None
+    outcome = trial.to_json()
+    outcome["dry_run"] = body.dry_run
+    status = "succeeded" if trial.postcondition_verified else "failed"
+    machine.complete(status, outcome)
+    result = machine.to_json()
+    result["trial"] = outcome
+    return result
+
+
+@app.get("/v1/actions/{action_id}")
+def action_detail(action_id: str) -> dict:
+    machine = _actions.get(action_id)
+    if machine is None:
+        raise HTTPException(404, "unknown action")
+    machine.reconcile()
+    return machine.to_json()
 
 
 _dist_dir = REPO_ROOT / "apps" / "console" / "dist"

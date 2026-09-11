@@ -2,9 +2,59 @@
 // method: one axis, thin marks, crosshair tooltips on time series,
 // direct labels selectively, text in ink tokens (never series hue).
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { EntityForecast, TaskForecast } from "../types";
 import { TASK_COLORS, TASKS } from "../types";
+
+/* ------------------------------------------------------------------ */
+/* Motion hooks                                                        */
+/* ------------------------------------------------------------------ */
+
+function prefersReducedMotion(): boolean {
+  try {
+    return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  } catch {
+    return false;
+  }
+}
+
+/** Animated number: rAF count-up on mount and on value change. */
+export function useCountUp(value: number, durationMs = 650): number {
+  const [display, setDisplay] = useState(value);
+  const fromRef = useRef(value);
+  const rafRef = useRef(0);
+
+  useEffect(() => {
+    if (prefersReducedMotion()) {
+      fromRef.current = value;
+      setDisplay(value);
+      return;
+    }
+    const from = fromRef.current;
+    if (from === value) return;
+    const start = performance.now();
+    const tick = (now: number) => {
+      const t = Math.min((now - start) / durationMs, 1);
+      const eased = 1 - Math.pow(1 - t, 3);
+      setDisplay(from + (value - from) * eased);
+      if (t < 1) {
+        rafRef.current = requestAnimationFrame(tick);
+      } else {
+        fromRef.current = value;
+      }
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [value, durationMs]);
+
+  return display;
+}
+
+/** Fingerprint for chart elements: changing it remounts the element, which
+ * replays its entrance animation when the data changes. */
+function fingerprint(parts: (string | number | undefined | null)[]): string {
+  return parts.map((p) => String(p ?? "")).join("|");
+}
 
 /* ------------------------------------------------------------------ */
 /* Status + layout atoms                                               */
@@ -258,10 +308,18 @@ export function RiskTimeline({
             const path = clipped
               .map((v, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(v).toFixed(1)}`)
               .join(" ");
+            const fp = fingerprint([
+              s.key,
+              clipped.length,
+              clipped[0]?.toFixed(4),
+              clipped[last]?.toFixed(4),
+              s.threshold,
+            ]);
             return (
-              <g key={s.key}>
+              <g key={fp}>
                 {s.threshold != null && s.threshold > 0 && s.threshold < 1 && (
                   <line
+                    className="fade-line"
                     x1={m.left}
                     x2={x(last)}
                     y1={y(s.threshold)}
@@ -278,6 +336,8 @@ export function RiskTimeline({
                   stroke={s.color}
                   strokeWidth={focusTask != null && focusTask !== Number(s.key) ? 1.25 : 2}
                   strokeDasharray={s.dashed ? "5 4" : undefined}
+                  pathLength={s.dashed ? undefined : 1}
+                  className={s.dashed ? "fade-line" : "draw-line"}
                   opacity={focusTask != null && focusTask !== Number(s.key) ? 0.38 : 1}
                   strokeLinecap="round"
                 />
@@ -387,11 +447,21 @@ export function ReliabilityChart({
           strokeWidth={1}
         />
         {path && (
-          <path d={path} fill="none" stroke="var(--task-0)" strokeWidth={2} strokeLinecap="round" />
+          <path
+            d={path}
+            fill="none"
+            stroke="var(--task-0)"
+            strokeWidth={2}
+            strokeLinecap="round"
+            pathLength={1}
+            className="draw-line"
+          />
         )}
         {points.map((p, i) => (
           <circle
             key={i}
+            className="pop-in"
+            style={{ animationDelay: `${200 + i * 40}ms` }}
             cx={x(p.mean_forecast!)}
             cy={y(p.observed_rate!)}
             r={Math.min(4 + Math.sqrt(p.count) * 0.9, 11)}
@@ -451,12 +521,14 @@ export function AttributionBars({
           const w = Math.abs(scale(item.delta));
           const supporting = item.delta > 0;
           return (
-            <g key={i}>
+            <g key={fingerprint([i, item.window_index, item.delta.toFixed(4)])}>
               <text x={labelW - 8} y={y + 12} fontSize={10.5} fill="var(--ink-3)" textAnchor="end"
                 fontFamily="var(--mono)">
                 w{item.window_index}
               </text>
               <rect
+                className={supporting ? "grow-l" : "grow-r"}
+                style={{ animationDelay: `${i * 35}ms` }}
                 x={supporting ? zeroX : zeroX - w}
                 y={y + 3}
                 width={w}
@@ -510,14 +582,17 @@ export function TaskBars({
           <div style={{ height: 9, background: "var(--chart)", borderRadius: 5, overflow: "hidden", border: "1px solid var(--border)" }}>
             {v.value != null && (
               <div
-                style={{
-                  width: `${Math.max(v.value * 100, 1.5)}%`,
-                  height: "100%",
-                  background: taskColor(v.task),
-                  opacity: 0.85,
-                  borderRadius: 5,
-                  transition: "width 400ms ease",
-                }}
+                key={v.value.toFixed(4)}
+                className="meter-fill"
+                style={
+                  {
+                    "--w": `${Math.max(v.value * 100, 1.5)}%`,
+                    height: "100%",
+                    background: taskColor(v.task),
+                    opacity: 0.85,
+                    borderRadius: 5,
+                  } as React.CSSProperties
+                }
               />
             )}
           </div>

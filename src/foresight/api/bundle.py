@@ -20,7 +20,9 @@ from ..calibration.hazard import CalibratorSet, HazardCalibrator
 from ..contracts.quality import NOT_SUPPORTED_WIRE
 from ..features.transforms import FeatureScaler
 from ..models.config import load_core_config
+from ..models.variants import build_world_model
 from ..models.world_model import ForesightWorldModel
+from ..paths.engine import PathEngine, load_path_engine
 from ..runtime.forecast import EnsembleForecaster, ForecastEngine
 from ..sentinel.reference import NoveltyReference
 
@@ -55,6 +57,12 @@ class RuntimeBundle:
     trained: bool
     weights_profile: str
     novelty_note: str = "reference fitted on benign training clips"
+    members: list[tuple[str, int]] = None  # I.5: [(variant, seed), ...]
+    path_engine: PathEngine | None = None   # Tier B §20 when trained
+
+    def __post_init__(self) -> None:
+        if self.members is None:
+            self.members = [("reference", s) for s in self.seeds]
 
     @property
     def params_per_member(self) -> int:
@@ -73,8 +81,6 @@ def load_bundle(
     root: Path, *, config_path: Path | None = None
 ) -> RuntimeBundle:
     """Load and verify a trained bundle, or the disclosed untrained fallback."""
-    from safetensors.torch import load_file
-
     config = load_core_config(config_path) if config_path else load_core_config(
         root.parents[1] / "configs" / "core.yaml"
     )
@@ -112,29 +118,53 @@ def load_bundle(
         (root / "task_manifest.json").read_text(encoding="utf-8")
     )
     seeds = tuple(manifest.get("seeds", [0, 1, 2]))
+    # I.5 heterogeneous members: manifest["members"] names each member's
+    # variant; legacy reference-only bundles fall back to the seeds list.
+    members: list[tuple[str, int]] = [
+        (str(m.get("variant", "reference")), int(m["seed"]))
+        for m in manifest.get("members", [])
+    ] or [("reference", s) for s in seeds]
 
-    engines: list[ForecastEngine] = []
-    for seed in seeds:
-        model_path = root / f"model_seed{seed}.safetensors"
-        if model_path.exists():
-            if f"model_seed{seed}.safetensors" in hashes:
-                if _sha256_file(model_path) != hashes[f"model_seed{seed}.safetensors"]:
-                    raise ArtifactError(f"bundle hash mismatch: model_seed{seed}")
-            state = load_file(str(model_path))
-        else:
-            raise ArtifactError(f"member weights missing: model_seed{seed}")
-        model = ForesightWorldModel.from_config(config, num_event_tasks=5)
-        model.load_state_dict(state)
-        model.eval()
-        cal = CalibratorSet(
-            calibrators={
+    def _member_weights(variant: str, seed: int) -> dict:
+        path = root / f"model_{variant}_seed{seed}.safetensors"
+        if not path.exists() and variant == "reference":
+            path = root / f"model_seed{seed}.safetensors"
+        if not path.exists():
+            raise ArtifactError(f"member weights missing: {variant}:{seed}")
+        name = path.name
+        if name in hashes:
+            if _sha256_file(path) != hashes[name]:
+                raise ArtifactError(f"bundle hash mismatch: {name}")
+        from safetensors.torch import load_file
+
+        return load_file(str(path))
+
+    def _member_calibrators(variant: str, seed: int) -> CalibratorSet:
+        # member-qualified keys "{variant}:{seed}:{task}"; legacy reference
+        # bundles use "{seed}:{task}".
+        cals = {
+            (int(k.split(":")[2]), None): HazardCalibrator.from_dict(v)
+            for k, v in calibrators.items()
+            if k.startswith(f"{variant}:{seed}:")
+        }
+        if not cals and variant == "reference":
+            cals = {
                 (int(k.split(":")[1]), None): HazardCalibrator.from_dict(v)
                 for k, v in calibrators.items()
-                if int(k.split(":")[0]) == seed
-            },
-            pooled=None,
+                if k.count(":") == 1 and int(k.split(":")[0]) == seed
+            }
+        return CalibratorSet(calibrators=cals, pooled=None)
+
+    engines: list[ForecastEngine] = []
+    variant_counts: dict[str, int] = {}
+    for variant, seed in members:
+        model = build_world_model(config, variant=variant, num_event_tasks=5)
+        model.load_state_dict(_member_weights(variant, seed))
+        model.eval()
+        variant_counts[variant] = variant_counts.get(variant, 0) + 1
+        engines.append(
+            ForecastEngine(model, calibrator_set=_member_calibrators(variant, seed))
         )
-        engines.append(ForecastEngine(model, calibrator_set=cal))
 
     novelty = None
     novelty_path = root / "novelty_reference.npz"
@@ -146,13 +176,24 @@ def load_bundle(
     if run_path.exists():
         run = json.loads(run_path.read_text(encoding="utf-8"))
 
+    seeds = tuple(s for v, s in members if v == "reference") or tuple(
+        s for _, s in members
+    )
+    hetero = "+".join(
+        f"{v}x{n}" for v, n in sorted(variant_counts.items())
+    )
     profile = (
-        f"Section-35 trained profile (seeds {list(seeds)}, "
+        f"Section-35 trained profile (I.5 heterogeneous ensemble: {hetero}, "
         f"{'synthetic corpus, disclosed' if manifest.get('synthetic_data_only') else 'undisclosed data'}"
         f"; best epochs "
         + ", ".join(
-            str(run.get("seeds", {}).get(str(s), {}).get("best_epoch", "?"))
-            for s in seeds
+            str(
+                run.get("seeds", {}).get(f"{v}:{s}", {}).get(
+                    "best_epoch",
+                    run.get("seeds", {}).get(str(s), {}).get("best_epoch", "?"),
+                )
+            )
+            for v, s in members
         )
         + ") with I.4 natural-prevalence calibration - interface semantics "
         "on synthetic data, not measured real-world performance"
@@ -169,6 +210,8 @@ def load_bundle(
         seeds=seeds,
         trained=True,
         weights_profile=profile,
+        members=members,
+        path_engine=load_path_engine(root.parents[1] / "artifacts" / "paths"),
     )
 
 

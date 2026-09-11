@@ -91,6 +91,8 @@ export function GraphView({
             return (
               <line
                 key={`o-${i}`}
+                className="g-edge"
+                style={{ animationDelay: `${Math.min(i * 22, 420)}ms` }}
                 x1={(a.x / 100) * width}
                 y1={(a.y / 100) * height}
                 x2={(b.x / 100) * width}
@@ -111,6 +113,8 @@ export function GraphView({
               return (
                 <line
                   key={`p-${i}`}
+                  className="g-edge"
+                  style={{ animationDelay: `${280 + i * 45}ms` }}
                   x1={(a.x / 100) * width}
                   y1={(a.y / 100) * height}
                   x2={(b.x / 100) * width}
@@ -124,7 +128,7 @@ export function GraphView({
             })}
 
           {/* nodes */}
-          {nodes.map((n) => {
+          {nodes.map((n, i) => {
             const cx = (n.x / 100) * width;
             const cy = (n.y / 100) * height;
             const active =
@@ -133,11 +137,12 @@ export function GraphView({
             return (
               <g
                 key={n.slot}
+                className="g-node"
+                style={{ animationDelay: `${Math.min(i * 34, 500)}ms`, cursor: "pointer" }}
                 transform={`translate(${cx},${cy})`}
                 onMouseEnter={() => setHover(n.name)}
                 onMouseLeave={() => setHover(null)}
                 onClick={() => onSelectEntity(n.name)}
-                style={{ cursor: "pointer" }}
               >
                 {active && <circle r={26} fill="url(#nodeGlow)" />}
                 <circle

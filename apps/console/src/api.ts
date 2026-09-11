@@ -2,11 +2,14 @@
 // structured error states instead of inventing values (L.2, UI01).
 
 import type {
+  ActionProposalPayload,
   CatalogEntry,
   EvaluationPayload,
   EvidencePayload,
   ForecastPayload,
   HealthPayload,
+  QueryAnswerPayload,
+  QueryProposalsPayload,
   RevealPayload,
   SessionSummary,
   TaskDef,
@@ -63,4 +66,40 @@ export const api = {
       body: JSON.stringify({ cutoff_window: cutoffWindow }),
     }),
   evaluation: () => request<EvaluationPayload>("/v1/evaluation"),
+  // Tier B (Sections 20-23)
+  queryProposals: (sessionId: string, cutoffWindow: number) =>
+    request<QueryProposalsPayload>("/v1/queries", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId, cutoff_window: cutoffWindow }),
+    }),
+  queryExecute: (sessionId: string, proposalId: string, cutoffWindow: number) =>
+    request<QueryAnswerPayload>(`/v1/queries/${proposalId}/execute`, {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId, cutoff_window: cutoffWindow }),
+    }),
+  actionPropose: (
+    sessionId: string,
+    cutoffWindow: number,
+    source: string,
+    target: string,
+  ) =>
+    request<ActionProposalPayload>("/v1/actions/propose", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: sessionId,
+        cutoff_window: cutoffWindow,
+        source,
+        target,
+      }),
+    }),
+  actionAuthorize: (actionId: string) =>
+    request<ActionProposalPayload>(`/v1/actions/${actionId}/authorize`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  actionExecute: (actionId: string, dryRun: boolean) =>
+    request<ActionProposalPayload>(`/v1/actions/${actionId}/execute`, {
+      method: "POST",
+      body: JSON.stringify({ dry_run: dryRun }),
+    }),
 };

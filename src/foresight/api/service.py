@@ -27,14 +27,21 @@ from ..data.clips import (
     precompute_episode,
     sample_cutoffs,
 )
-from ..data.episodes import Episode, build_episode
+from ..data.episodes import Episode, build_episode, is_internal
 from ..explain.attribution import AttributionBudget, explain_target
 from ..explain.paths import rank_candidate_edges
 from ..features.registry import GLOBAL_FEATURE_NAMES, NODE_FEATURE_NAMES
 from ..graphs.collate import collate_windows
+from ..ingest.identity import (
+    IdentityAdapter,
+    generate_identity_log,
+    identity_log_csv,
+)
 from ..labels.ontology import SIH_TACTICS, TASK_DEFINITIONS
 from ..labels.targets import all_pair_candidates
 from ..models.survival import conditional_eta
+from ..paths.candidates import build_candidate_set
+from ..queries import QueryEngine
 from ..runtime.forecast import ForecastRequest
 from ..sentinel.reference import window_to_device
 from ..sentinel.scorer import SentinelScorer, collect_matured_residuals
@@ -119,6 +126,8 @@ class EpisodeSession:
     created_at: float = 0.0
     forecast_cache: dict[int, dict] = None
     record_ids: dict[int, str] = None
+    query_engine: QueryEngine = None
+    identity_quality: dict = None
 
     def __post_init__(self) -> None:
         if self.precomputed is None:
@@ -129,6 +138,18 @@ class EpisodeSession:
             self.record_ids = {}
         if not self.created_at:
             self.created_at = time.time()
+        # Tier B identity modality: a separate replay-only telemetry stream
+        # (Section 21). Generated deterministically, parsed by the real
+        # adapter boundary, never read by the forecasting pipeline.
+        if self.query_engine is None:
+            records = generate_identity_log(self.episode)
+            parsed = IdentityAdapter().parse(identity_log_csv(records))
+            self.identity_quality = parsed.quality_report
+            self.query_engine = QueryEngine(parsed.records)
+
+    @property
+    def identity_log_csv_text(self) -> str:
+        return identity_log_csv(generate_identity_log(self.episode))
 
     # ------------------------------------------------------------------
     @property
@@ -321,12 +342,14 @@ class EpisodeSession:
         graph = self._graph_payload(example, cutoff_window)
         novelty = self._novelty_payload(example, cutoff_window)
         flags = self._flagged_evidence(cutoff_window)
+        paths_payload = self._paths_payload(example, result, cutoff_window)
 
         return {
             "weights_profile": self.bundle.weights_profile,
             "model": {
                 "kind": "ensemble",
                 "members": len(self.bundle.engines),
+                "variants": [v for v, _s in self.bundle.members],
                 "seeds": list(self.bundle.seeds),
                 "params_per_member": self.bundle.params_per_member,
                 "trained": self.bundle.trained,
@@ -352,25 +375,51 @@ class EpisodeSession:
                 ],
                 "observed_hosts": len(self.entity_ids),
             },
-            "paths": {
-                "status": "not_supported",
-                "note": (
-                    "Tier B typed-event path search is not implemented; "
-                    "candidate edges are marginal future-communication "
-                    "probabilities, not a calibrated attack path (Section 20)"
-                ),
-                "candidate_edges": (
-                    rank_candidate_edges(
-                        result.edge_logits,
-                        example.candidate_pairs,
-                        example.entity_ids,
-                        horizon_bins=result.horizon_bins,
-                    ).to_json()["edges"]
-                    if result.edge_logits is not None
-                    else []
-                ),
-            },
+            "paths": paths_payload,
         }
+
+    def _paths_payload(self, example, result, cutoff_window: int) -> dict:
+        """Tier A candidate-edge projection + Tier B typed-event paths.
+
+        The two are never merged: marginal future-communication probabilities
+        (edge head) stay separate from the next-mark decoder's autoregressive
+        path products (Section 20)."""
+        payload = {
+            "status": "not_supported",
+            "note": (
+                "Tier B typed-event path search has no trained bundle; "
+                "candidate edges are marginal future-communication "
+                "probabilities, not a calibrated attack path (Section 20)"
+            ),
+            "candidate_edges": (
+                rank_candidate_edges(
+                    result.edge_logits,
+                    example.candidate_pairs,
+                    example.entity_ids,
+                    horizon_bins=result.horizon_bins,
+                ).to_json()["edges"]
+                if result.edge_logits is not None
+                else []
+            ),
+        }
+        engine = self.bundle.path_engine
+        if engine is None:
+            return payload
+        with torch.no_grad():
+            model = self.bundle.engines[0].model
+            device = next(model.parameters()).device
+            state = model.observe_clip(
+                [window_to_device(w, device) for w in example.windows]
+            )
+        forecast = engine.forecast(
+            self.episode,
+            state.entity_memory,
+            state.global_context,
+            cutoff_window,
+        )
+        payload.update(forecast.to_json())
+        payload["weights_profile"] = engine.weights_profile
+        return payload
 
     def _role(self, entity_name: str) -> str:
         for host in self.episode.capture.hosts:
@@ -431,7 +480,46 @@ class EpisodeSession:
             }
             for (u, v), ws in sorted(edge_windows.items())
         ]
-        return {"nodes": nodes, "observed_edges": observed}
+        external_edges = self._observed_external_pairs(cutoff_window)
+        return {"nodes": nodes, "observed_edges": observed, "external_edges": external_edges}
+
+    def _observed_external_pairs(self, cutoff_window: int) -> list[dict]:
+        """Directed internal<->external pairs on the eligible prefix (the
+        block_edge scope allowlist draws from these; graph edges are
+        internal-only by G.2)."""
+        import numpy as np
+
+        cutoff_ns = cutoff_window * WINDOW_NS
+        table = self.episode.capture.packets
+        names = [h.name for h in self.episode.capture.hosts]
+        mask = (
+            (table["t_ns"] <= cutoff_ns)
+            & (table["available_ns"] <= cutoff_ns)
+            & (table["ingested_ns"] <= cutoff_ns)
+        )
+        rows = np.where(mask)[0]
+        counts: dict[tuple[str, str], dict] = {}
+        for r in rows:
+            s = names[int(table["src"][r])]
+            d = names[int(table["dst"][r])]
+            s_int, d_int = is_internal(s), is_internal(d)
+            if s_int == d_int:
+                continue  # only cross-boundary pairs matter here
+            key = (s, d)
+            entry = counts.setdefault(key, {"packets": 0, "last_window": 0})
+            entry["packets"] += 1
+            entry["last_window"] = max(
+                entry["last_window"], int(table["t_ns"][r]) // WINDOW_NS
+            )
+        return [
+            {
+                "source": s,
+                "target": t,
+                "packets": v["packets"],
+                "last_window": v["last_window"],
+            }
+            for (s, t), v in sorted(counts.items())
+        ]
 
     def _novelty_payload(self, example, cutoff_window: int) -> dict:
         """SENTINEL diagnostics from matured residuals + embeddings."""
@@ -652,3 +740,35 @@ class EpisodeSession:
             "events": events,
             "forecast_comparison": comparison,
         }
+
+    # ------------------------------------------------------------------
+    def propose_queries(self, cutoff_window: int) -> dict:
+        """Tier B evidence requests (Section 21): transparent-rule proposals
+        from the committed forecast at this cutoff."""
+        payload = self.forecast_cache.get(cutoff_window)
+        if payload is None:
+            raise ValueError("run the forecast at this cutoff first")
+        proposals = self.query_engine.propose(payload, cutoff_window)
+        return {
+            "cutoff_window": cutoff_window,
+            "policy": self.query_engine.status(),
+            "identity_quality": self.identity_quality,
+            "proposals": proposals,
+            "note": (
+                "default stretch policy (Section 21): a transparent rule, not "
+                "a learned selector; waiting and acting immediately remain "
+                "the comparison policies"
+            ),
+        }
+
+    def execute_query(self, proposal_id: str, cutoff_window: int) -> dict:
+        """Execute one allowlisted request; answers carry their own clocks
+        and create a new forecast version (never rewrite the seal)."""
+        if cutoff_window not in self.valid_cutoffs():
+            raise ValueError(f"unknown cutoff_window {cutoff_window}")
+        answer = self.query_engine.execute(
+            proposal_id, cutoff_window * WINDOW_NS
+        )
+        answer["cutoff_window"] = cutoff_window
+        answer["query_policy"] = self.query_engine.status()
+        return answer

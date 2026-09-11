@@ -64,6 +64,18 @@ def main() -> None:
     report.save(out_path)
     print(f"report -> {out_path}")
 
+    # Keep the I.6 hash manifest self-consistent: the report is written
+    # after the training run froze artifact_hashes.json, so refresh its
+    # entry here (SE01 — every recorded hash must match the file on disk).
+    import hashlib
+
+    hashes_path = args.bundle / "artifact_hashes.json"
+    if hashes_path.exists():
+        hashes = json.loads(hashes_path.read_text(encoding="utf-8"))
+        hashes[out_path.name] = hashlib.sha256(out_path.read_bytes()).hexdigest()
+        hashes_path.write_text(json.dumps(hashes, indent=2), encoding="utf-8")
+        print(f"hash manifest refreshed: {out_path.name}")
+
     print("\n== gates ==")
     for gate in report.gates:
         print(

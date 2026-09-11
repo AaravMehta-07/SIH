@@ -144,7 +144,7 @@ export function ForecastView({
 
       {error && <ErrorPanel message={error} />}
 
-      <div className="tiles" style={{ marginBottom: 16 }}>
+      <div className="tiles stagger" style={{ marginBottom: 16 }}>
         <Tile
           label="Alerting entities"
           value={String(alertingCount)}
@@ -191,7 +191,7 @@ export function ForecastView({
         />
       </div>
 
-      <div className="grid forecast-layout" style={{ gridTemplateColumns: "300px minmax(0,1fr)", alignItems: "start" }}>
+      <div className="grid forecast-layout stagger" style={{ gridTemplateColumns: "300px minmax(0,1fr)", alignItems: "start" }}>
         {/* entity list */}
         <div className="panel">
           <div className="panel-head">

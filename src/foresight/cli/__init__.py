@@ -80,6 +80,18 @@ def cmd_doctor(args) -> int:
                 ),
             }
         )
+        checks.append(
+            {
+                "check": "tier_b_paths",
+                "ok": True,
+                "detail": (
+                    "trained (Section 20 next-mark decoder)"
+                    if bundle.path_engine is not None
+                    else "not trained (typed paths report not_supported; "
+                    "run scripts/train_paths.py)"
+                ),
+            }
+        )
     except ArtifactError as exc:
         ok = False
         checks.append({"check": "artifact_bundle", "ok": False, "detail": str(exc)})

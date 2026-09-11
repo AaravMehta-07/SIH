@@ -140,16 +140,126 @@ def test_reveal_returns_ground_truth(client, lateral_session):
     assert 1 in tasks and 2 in tasks  # initial access + lateral movement
 
 
-def test_queries_typed_disabled(client):
-    resp = client.post("/v1/queries", json={"query": "process-tree"})
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "not_supported"
+def test_queries_require_known_session(client):
+    resp = client.post(
+        "/v1/queries", json={"session_id": "sess-nope", "cutoff_window": 40}
+    )
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["code"] == "http_404"
 
 
-def test_actions_typed_disabled(client):
-    resp = client.post("/v1/actions/propose", json={})
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "not_supported"
+def test_queries_real_tier_b_flow(client, lateral_session):
+    """Section 21 evidence requests: proposals from the committed forecast,
+    typed execution states, 422 on unknown proposals."""
+    sid = lateral_session["session_id"]
+    cutoff = lateral_session["valid_cutoffs"][5]
+    forecast = client.post(
+        f"/v1/sessions/{sid}/forecast", json={"cutoff_window": cutoff}
+    )
+    assert forecast.status_code == 200
+    resp = client.post(
+        "/v1/queries", json={"session_id": sid, "cutoff_window": cutoff}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["policy"]["query_type"] == "identity_session_detail"
+    assert body["identity_quality"]["parsed_rows"] > 0
+    for p in body["proposals"]:
+        assert p["cost"]["privacy"] > 0
+        assert p["status"] == "proposed"
+    # unknown proposal: typed 422, never a crash
+    bad = client.post(
+        "/v1/queries/qp-nope/execute",
+        json={"session_id": sid, "cutoff_window": cutoff},
+    )
+    assert bad.status_code == 422
+
+
+def test_actions_propose_policy_checked(client, lateral_session):
+    """Sections 22-23: proposals bind the forecast hash; unobserved or
+    internal-only pairs fail the scope allowlist and stay unauthorized."""
+    sid = lateral_session["session_id"]
+    cutoff = lateral_session["valid_cutoffs"][5]
+    forecast = client.post(
+        f"/v1/sessions/{sid}/forecast", json={"cutoff_window": cutoff}
+    )
+    assert forecast.status_code == 200
+    # observed cross-boundary pair (the web server beacons to C2)
+    ok = client.post(
+        "/v1/actions/propose",
+        json={
+            "session_id": sid,
+            "cutoff_window": cutoff,
+            "source": "web-01.dmz.local",
+            "target": "ext-c2-01.net",
+        },
+    )
+    assert ok.status_code == 200, ok.text
+    body = ok.json()
+    assert body["action_type"] == "block_edge"
+    assert body["authorizable"] is True
+    assert body["evidence_binding"]["forecast_hash"]
+    assert any(a["action"] == "no_action" for a in body["alternatives"])
+
+    # internal-only pair: scope allowlist rejects it
+    internal = client.post(
+        "/v1/actions/propose",
+        json={
+            "session_id": sid,
+            "cutoff_window": cutoff,
+            "source": "web-01.dmz.local",
+            "target": "srv-app-02.corp.local",
+        },
+    )
+    assert internal.status_code == 200
+    assert internal.json()["authorizable"] is False
+
+    # execution without authorization is a typed 409 (Section 23)
+    denied = client.post(
+        f"/v1/actions/{body['action_id']}/execute", json={"dry_run": True}
+    )
+    assert denied.status_code == 409
+
+
+def test_actions_authorize_and_execute_paired_trial(client, lateral_session):
+    """The full Section-23 lifecycle: authorize -> execute once -> paired
+    trial outcome with a verified postcondition."""
+    sid = lateral_session["session_id"]
+    cutoff = lateral_session["valid_cutoffs"][5]
+    client.post(f"/v1/sessions/{sid}/forecast", json={"cutoff_window": cutoff})
+    proposal = client.post(
+        "/v1/actions/propose",
+        json={
+            "session_id": sid,
+            "cutoff_window": cutoff,
+            "source": "web-01.dmz.local",
+            "target": "ext-c2-01.net",
+        },
+    ).json()
+    assert proposal["authorizable"] is True
+
+    authorized = client.post(
+        f"/v1/actions/{proposal['action_id']}/authorize", json={}
+    )
+    assert authorized.status_code == 200
+    assert authorized.json()["status"] == "authorized"
+
+    executed = client.post(
+        f"/v1/actions/{proposal['action_id']}/execute", json={"dry_run": True}
+    )
+    assert executed.status_code == 200, executed.text
+    result = executed.json()
+    assert result["status"] in ("succeeded", "failed")
+    trial = result["trial"]
+    assert trial["cutoff_window"] == cutoff
+    assert "no_action" in trial and "action_arm" in trial
+    assert trial["dry_run"] is True
+    # executing twice: idempotency key consumed (Section 23)
+    again = client.post(
+        f"/v1/actions/{proposal['action_id']}/execute", json={"dry_run": True}
+    )
+    assert again.status_code == 409
 
 
 def test_evaluation_golden_example(client):
