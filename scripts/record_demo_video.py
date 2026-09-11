@@ -33,8 +33,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8001")
     parser.add_argument("--catalog-id", default=None)
-    parser.add_argument("--width", type=int, default=1440)
-    parser.add_argument("--height", type=int, default=900)
+    parser.add_argument("--width", type=int, default=1920)
+    parser.add_argument("--height", type=int, default=1080)
     args = parser.parse_args()
     base = args.base.rstrip("/")
 
@@ -51,7 +51,7 @@ def main() -> int:
         # 1. entry: the catalog (real + synthetic captures)
         page.goto(base, wait_until="networkidle")
         page.wait_for_selector(".catalog-card", timeout=60000)
-        time.sleep(4.0)
+        time.sleep(7.0)
 
         catalog_id = args.catalog_id or "demo-02"
         card = page.locator(".catalog-card", has_text="Web compromise")
@@ -60,42 +60,42 @@ def main() -> int:
         # 2. open the capture -> workspace
         card.locator("button", has_text="Open session").click()
         page.wait_for_selector(".task-row", timeout=180000)
-        time.sleep(3.0)
+        time.sleep(8.0)
 
         # 3. select the compromised host (web server) — inspection panel
         page.locator(".entity-row", has_text="web-01").first.click()
-        time.sleep(3.5)
+        time.sleep(8.0)
 
         # 4. switch horizon to 30 min — trajectory change
         page.locator(".horizon-tabs button", has_text="30 min").click()
-        time.sleep(3.0)
+        time.sleep(6.0)
 
         # 5. evidence: deletion-tested attribution
         page.locator(".nav button", has_text="Evidence").click()
         page.wait_for_selector(".tiles", timeout=120000)
-        time.sleep(6.0)
+        time.sleep(10.0)
 
         # 6. sealed replay: commitment theater + REVEAL
         page.locator(".nav button", has_text="Replay").click()
         page.wait_for_selector(".theater", timeout=60000)
-        time.sleep(3.5)
+        time.sleep(8.0)
         page.locator("button", has_text="Reveal future").click()
         page.wait_for_selector(".pva-board", timeout=120000)
-        time.sleep(5.0)
+        time.sleep(10.0)
 
         # 7. evaluation: honest gates
         page.locator(".nav button", has_text="Evaluation").click()
         page.wait_for_selector("text=Golden contract check", timeout=60000)
-        time.sleep(5.0)
+        time.sleep(8.0)
 
         # 8. attack-path hypotheses
         page.locator(".nav button", has_text="Paths").click()
         page.wait_for_selector(".paths-list", timeout=60000)
-        time.sleep(5.0)
+        time.sleep(8.0)
 
         # 9. close on the workspace
         page.locator(".nav button", has_text="Forecast").click()
-        time.sleep(3.0)
+        time.sleep(5.0)
 
         video = page.video.path()
         context.close()
@@ -111,7 +111,7 @@ def main() -> int:
         mp4 = OUT_DIR / "foresight-demo.mp4"
         result = subprocess.run(
             [ffmpeg, "-y", "-i", str(webm), "-c:v", "libx264",
-             "-pix_fmt", "yuv420p", "-crf", "23", str(mp4)],
+             "-pix_fmt", "yuv420p", "-preset", "slow", "-crf", "17", str(mp4)],
             capture_output=True, text=True,
         )
         if result.returncode == 0 and mp4.exists():
