@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from .reference import FEATURE_GROUPS, NoveltyReference
+from .reference import FEATURE_GROUPS, NoveltyReference, window_to_device
 
 NOVELTY_REFERENCE_LIKE = "reference_like"
 NOVELTY_NOVEL = "novel"
@@ -60,14 +60,15 @@ def collect_matured_residuals(
     """
     num_windows = len(clip_windows)
     out: list[MaturedResidual] = []
-    if latest_cutoff_window <= 20 + residual_horizon:
+    if num_windows <= 20 + residual_horizon:
         return out  # warmup: nothing matured yet
     model.eval()
     with torch.no_grad():
-        for cutoff in range(
-            20, min(latest_cutoff_window - residual_horizon + 1, num_windows - residual_horizon + 1), 5
-        ):
-            past = [w.to(device) for w in clip_windows[:cutoff]]
+        # Forecasts replayed at cutoffs INSIDE the clip; each prediction is
+        # paired with the clip's actual window that arrives after it
+        # (matured by construction, NO01).
+        for cutoff in range(5, num_windows - residual_horizon + 1, 5):
+            past = [window_to_device(w, device) for w in clip_windows[:cutoff]]
             observed = model.observe_clip(past)
             outputs = model.roll_out(observed, residual_horizon)
             predicted = (

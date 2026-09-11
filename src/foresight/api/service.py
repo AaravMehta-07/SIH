@@ -36,6 +36,7 @@ from ..labels.ontology import SIH_TACTICS, TASK_DEFINITIONS
 from ..labels.targets import all_pair_candidates
 from ..models.survival import conditional_eta
 from ..runtime.forecast import ForecastRequest
+from ..sentinel.reference import window_to_device
 from ..sentinel.scorer import SentinelScorer, collect_matured_residuals
 from ..storage.store import Storage
 from .bundle import RuntimeBundle
@@ -452,7 +453,9 @@ class EpisodeSession:
         )
         # one observed state; slice each entity's memory row from it
         with torch.no_grad():
-            state = engine.model.observe_clip([w.to(device) for w in windows])
+            state = engine.model.observe_clip(
+                [window_to_device(w, device) for w in windows]
+            )
         results = {}
         for slot, name in enumerate(example.entity_ids):
             diag = scorer.score(state.entity_memory[0, slot], matured, entity=name)

@@ -272,7 +272,9 @@ def collect_cal_records(
                 task_mask=ex.targets.task_mask,
                 min_occurrence_probability=0.30,
                 published_horizons_seconds=(300,),
-                candidate_pairs=ex.targets.candidate_pairs,
+                candidate_pairs=candidates_to_device(
+                    ex.targets.candidate_pairs, device
+                ),
             )
             result = ensemble.forecast(windows, request)
             for entity in result.entities:
@@ -355,7 +357,9 @@ def predict_locked_test(
             task_mask=ex.targets.task_mask,
             min_occurrence_probability=0.30,
             published_horizons_seconds=(300, 900, 1800),
-            candidate_pairs=ex.targets.candidate_pairs,
+            candidate_pairs=candidates_to_device(
+                ex.targets.candidate_pairs, device
+            ),
         )
         result = ensemble.forecast(windows, request)
         for entity in result.entities:
@@ -414,6 +418,10 @@ def main() -> None:
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     print(f"device: {device}", flush=True)
+    # Thread caps: this run shares a 16 GB host with the user's own
+    # workload; every avoided thread stack and workspace is margin against
+    # the system memory guard.
+    torch.set_num_threads(4)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 

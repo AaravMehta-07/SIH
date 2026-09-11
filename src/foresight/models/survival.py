@@ -162,7 +162,12 @@ def mixture_from_distributions(
     # S_mix[j-1] = 1 - sum_{k<j} event_mass[k]
     cumulative_mass = torch.cumsum(event_mass, dim=-1)
     survival_prev = torch.cat(
-        [torch.ones(1, dtype=event_mass.dtype), 1.0 - cumulative_mass[:-1]]
+        [
+            torch.ones(
+                1, dtype=event_mass.dtype, device=event_mass.device
+            ),
+            1.0 - cumulative_mass[:-1],
+        ]
     )
     hazards = torch.where(
         survival_prev > 0,

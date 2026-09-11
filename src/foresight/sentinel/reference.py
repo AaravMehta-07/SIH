@@ -10,10 +10,25 @@ starting implementation (J.1).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
+
+from ..models.types import CandidatePairs, GraphWindowBatch
+
+
+def window_to_device(window: GraphWindowBatch, device) -> GraphWindowBatch:
+    return GraphWindowBatch(
+        x=window.x.to(device),
+        edge_index=window.edge_index.to(device),
+        edge_attr=window.edge_attr.to(device),
+        batch=window.batch.to(device),
+        slot_index=window.slot_index.to(device),
+        node_present=window.node_present.to(device),
+        node_observation_valid=window.node_observation_valid.to(device),
+        global_raw=window.global_raw.to(device),
+    )
 
 # Node-feature groups (positions into the 44 registry). Residual aggregation
 # and reporting happen per group so analysts see *which* traffic family is
@@ -111,26 +126,29 @@ def fit_novelty_reference(
     with torch.no_grad():
         for ex in benign_examples:
             num_windows = len(ex.windows)
-            for cutoff in range(20, num_windows - residual_horizon, cutoff_stride):
-                past = [w.to(device) for w in ex.windows[:cutoff]]
+            # Replay forecasts at cutoffs INSIDE the 20-window clip; each
+            # prediction is compared with the clip's actual windows that
+            # arrive after that cutoff (matured by construction, NO01).
+            for cutoff in range(5, num_windows - residual_horizon + 1, cutoff_stride):
+                past = [window_to_device(w, device) for w in ex.windows[:cutoff]]
                 observed = model.observe_clip(past)
                 outputs = model.roll_out(observed, residual_horizon)
                 # predicted node features per future bin [H, N, 44]
                 predicted = torch.stack(
                     [o.node_mean[0] for o in outputs], dim=0
                 ).cpu().numpy()
-                # actual future windows (full-information labels already
-                # arrived in this offline setting: matured by construction)
-                future = ex.targets.node_values[:, :residual_horizon, :].numpy()
-                valid = ex.targets.node_valid[:, :residual_horizon, :].numpy()
-                residual = (future - predicted) * valid  # zero where invalid
-                for group, positions in FEATURE_GROUPS.items():
-                    pos = list(positions)
-                    group_residuals[group].append(
-                        residual[:, :, pos].reshape(-1, len(pos))
-                    )
-                residual_count += int(valid[:, :residual_horizon, :].sum())
-            state = model.observe_clip([w.to(device) for w in ex.windows])
+                for h in range(residual_horizon):
+                    window = ex.windows[cutoff + h]
+                    actual = window.x[0, :44].cpu().numpy()
+                    validity = window.x[0, 44:].cpu().numpy()
+                    residual = (actual - predicted[h]) * validity
+                    for group, positions in FEATURE_GROUPS.items():
+                        pos = list(positions)
+                        group_residuals[group].append(
+                            residual[:, pos].reshape(-1, len(pos))
+                        )
+                    residual_count += int(validity.sum())
+            state = model.observe_clip([window_to_device(w, device) for w in ex.windows])
             embeddings.append(state.entity_memory[0].cpu().numpy())
 
     group_median = {}
