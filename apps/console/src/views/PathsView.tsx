@@ -125,20 +125,17 @@ export function PathsView({
             />
           </div>
 
-          <div className="panel">
-            <div className="panel-head">
-              <h2>Ranked paths</h2>
-              <span className="hint">
-                calibrated: false · mass accounting sums to{" "}
-                {(
-                  (paths?.no_event_mass ?? 0) +
-                  (paths?.outside_candidate_mass ?? 0) +
-                  (paths?.truncated_search_mass ?? 0) +
-                  (paths?.ranked_paths ?? []).reduce((s, p) => s + p.probability, 0)
-                ).toFixed(3)}
+          <div className="v2-section">
+            <div className="v2-section-head">
+              <h3>Ranked paths</h3>
+              <span className="v2-hint">
+                calibrated: false · mass accounting{" "}
+                {paths?.mass_accounting_total != null
+                  ? paths.mass_accounting_total.toFixed(3)
+                  : "—"}
               </span>
             </div>
-            <div className="panel-body flush paths-list">
+            <div className="paths-list">
               {ranked.length === 0 && (
                 <div className="empty-state">
                   <span className="glyph">◌</span>
@@ -153,16 +150,16 @@ export function PathsView({
         </>
       )}
 
-      <div className="panel" style={{ marginTop: 14 }}>
-        <div className="panel-head">
-          <h2>Candidate communication edges</h2>
+      <div className="v2-section">
+        <div className="v2-section-head">
+          <h3>Candidate communication edges</h3>
           <button className="btn ghost small" onClick={() => setShowGraph((v) => !v)} aria-pressed={showGraph}>
-            {showGraph ? "Hide graph" : "Show graph"}
+            {showGraph ? "Table view" : "Graph view"}
           </button>
         </div>
-        <div className="panel-body">
-          {forecast ? (
-            showGraph ? (
+        {forecast ? (
+          showGraph ? (
+            <div className="graph-region" style={{ background: "var(--surface-1)", borderRadius: "var(--radius-v2)" }}>
               <GraphView
                 nodes={forecast.graph.nodes}
                 observedEdges={forecast.graph.observed_edges}
@@ -171,32 +168,32 @@ export function PathsView({
                 selectedEntity={null}
                 onSelectEntity={() => undefined}
               />
-            ) : (
-              <div className="table-wrap">
-                <table className="data">
-                  <thead>
-                    <tr>
-                      <th>Source</th>
-                      <th>Target</th>
-                      <th className="num">Marginal probability</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(paths?.candidate_edges ?? []).slice(0, 12).map((e) => (
-                      <tr key={`${e.source}->${e.target}`}>
-                        <td className="host-name">{e.source}</td>
-                        <td className="host-name">{e.target}</td>
-                        <td className="num">{pct(e.probability)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )
+            </div>
           ) : (
-            <div className="muted">Run a forecast to see candidate edges.</div>
-          )}
-        </div>
+            <div className="table-wrap">
+              <table className="data">
+                <thead>
+                  <tr>
+                    <th>Source</th>
+                    <th>Target</th>
+                    <th className="num">Marginal probability</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(paths?.candidate_edges ?? []).slice(0, 12).map((e) => (
+                    <tr key={`${e.source}->${e.target}`}>
+                      <td className="host-name">{e.source}</td>
+                      <td className="host-name">{e.target}</td>
+                      <td className="num">{pct(e.probability)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        ) : (
+          <div className="muted">Run a forecast to see candidate edges.</div>
+        )}
       </div>
     </div>
   );

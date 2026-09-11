@@ -6,12 +6,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 import { StatusStrip } from "./components/StatusStrip";
-import { ActionView } from "./views/ActionView";
 import { EvaluationView } from "./views/EvaluationView";
 import { EvidenceView } from "./views/EvidenceView";
 import { ForecastView } from "./views/ForecastView";
 import { PathsView } from "./views/PathsView";
-import { QueryView } from "./views/QueryView";
 import { ReplayView } from "./views/ReplayView";
 import { SessionsView } from "./views/SessionsView";
 import type {
@@ -26,21 +24,17 @@ type View =
   | "sessions"
   | "forecast"
   | "evidence"
-  | "replay"
-  | "evaluation"
   | "paths"
-  | "queries"
-  | "actions";
+  | "replay"
+  | "evaluation";
 
 const VIEWS: { id: View; label: string; key: string }[] = [
   { id: "sessions", label: "Sessions", key: "1" },
   { id: "forecast", label: "Forecast", key: "2" },
   { id: "evidence", label: "Evidence", key: "3" },
-  { id: "replay", label: "Replay", key: "4" },
-  { id: "evaluation", label: "Evaluation", key: "5" },
-  { id: "paths", label: "Paths", key: "6" },
-  { id: "queries", label: "Query", key: "7" },
-  { id: "actions", label: "Action", key: "8" },
+  { id: "paths", label: "Paths", key: "4" },
+  { id: "replay", label: "Replay", key: "5" },
+  { id: "evaluation", label: "Evaluation", key: "6" },
 ];
 
 export default function App() {
@@ -228,6 +222,7 @@ export default function App() {
             <b>Demonstration profile.</b> {disclosure} No measured real-world
             performance is claimed (Build Spec Section 29); unsupported targets
             report <span className="mono">not_supported</span>, never zero.
+            {session?.data_disclosure ? <> <b>Active source:</b> {session.data_disclosure}</> : null}
           </span>
         </div>
 
@@ -288,14 +283,6 @@ export default function App() {
             loading={forecastLoading}
             error={forecastError}
           />
-        )}
-
-        {view === "queries" && session && (
-          <QueryView session={session} forecast={forecast} />
-        )}
-
-        {view === "actions" && session && (
-          <ActionView session={session} forecast={forecast} />
         )}
       </main>
     </>

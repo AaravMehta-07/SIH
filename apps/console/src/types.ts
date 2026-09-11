@@ -22,6 +22,7 @@ export interface CatalogEntry {
   family: string;
   synthetic: boolean;
   source_format: string;
+  available?: boolean;
 }
 
 export interface TaskDef {
@@ -46,9 +47,13 @@ export interface SessionSummary {
   weights_profile: string;
   history_windows?: number;
   parse_status?: string;
-  packet_count?: number;
+  observation_count?: number;
+  observation_unit?: "packet" | "flow";
   capabilities?: Record<string, unknown>;
   observation_gaps?: { host: string; from_ns: string; to_ns: string }[];
+  capability_report?: { fields: { field_group: string; state: string; reason: string; source_count: number }[] };
+  quality_report?: Record<string, number> | null;
+  data_disclosure?: string;
 }
 
 export interface ConditionalEta {
@@ -147,6 +152,7 @@ export interface PathsPayload {
   no_event_mass?: number;
   outside_candidate_mass?: number;
   truncated_search_mass?: number;
+  mass_accounting_total?: number;
   beam?: { width: number; depth: number };
   candidate_pairs?: { cutoff_window: number; pair_count: number; kinds: Record<string, number> };
   calibrated?: boolean;
@@ -353,7 +359,30 @@ export interface ForecastPayload {
     committed: boolean;
     published_at_ns: string;
     compute_to_ledger_seconds: number;
+    provenance?: ForecastProvenance;
   };
+}
+
+/** Section-7/T.4 seal inputs bound into every committed forecast. */
+export interface ForecastProvenance {
+  legal_prefix_hash: string;
+  eligibility_rule_id: string;
+  source_object_hashes: Record<string, string>;
+  artifact_hashes: {
+    manifest?: string;
+    scaler?: string;
+    calibrators?: string;
+    selection_policy?: string;
+    task_manifest?: string;
+    config?: string;
+    models?: Record<string, string>;
+  };
+  policy_context: {
+    selection_policy_hash?: string;
+    alert_budget_per_100_asset_hours: number;
+  };
+  runtime_profile: string;
+  omitted_computations: string[];
 }
 
 export interface EvidenceItem {

@@ -46,10 +46,8 @@ export function SessionsView({
         <div>
           <h1>Capture sessions</h1>
           <p className="sub">
-            Offline demonstration captures — synthetic packet telemetry through the
-            full Section-26 pipeline: eligibility-gated prefix windows, the
-            44/11/24 feature registry, and sealed forecasts with publication
-            receipts.
+            Offline capture replays through the Section-26 pipeline. Each source
+            discloses which flow and packet measurements are actually available.
           </p>
         </div>
       </div>
@@ -66,7 +64,9 @@ export function SessionsView({
                 <span className={`tag ${attack ? "attack" : "benign"}`}>
                   {FAMILY_LABEL[entry.campaign] ?? entry.campaign}
                 </span>
-                <span className="tag synth">synthetic · disclosed</span>
+                <span className={`tag ${entry.synthetic ? "synth" : "benign"}`}>
+                  {entry.synthetic ? "synthetic · disclosed" : "real capture · disclosed"}
+                </span>
               </div>
               <h3>{entry.title}</h3>
               <p>{entry.summary}</p>
@@ -75,9 +75,11 @@ export function SessionsView({
                 <button
                   className="btn primary small"
                   onClick={() => open(entry.catalog_id)}
-                  disabled={opening === entry.catalog_id || loading}
+                  disabled={entry.available === false || opening === entry.catalog_id || loading}
                 >
-                  {opening === entry.catalog_id ? "Opening…" : "Open session"}
+                  {entry.available === false
+                    ? "Dataset not installed"
+                    : opening === entry.catalog_id ? "Opening…" : "Open session"}
                 </button>
               </div>
             </div>
@@ -123,7 +125,7 @@ export function SessionsView({
                 </thead>
                 <tbody>
                   {sessions.map((s) => (
-                    <tr key={s.session_id} className="clickable" onClick={() => onSelect(s)}>
+                    <tr key={s.session_id}>
                       <td className="mono">{s.session_id}</td>
                       <td>{s.title}</td>
                       <td>

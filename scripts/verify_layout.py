@@ -38,10 +38,10 @@ def main() -> int:
         page.locator(".catalog-card", has_text="Web compromise").locator(
             "button", has_text="Open session"
         ).click()
-        page.wait_for_selector(".tiles", timeout=60000)
+        page.wait_for_selector(".workspace", timeout=60000)
         # the forecast payload must land before chart marks exist (the first
         # forecast on a cold server can outlive any fixed sleep)
-        page.wait_for_selector("table.data tbody tr", timeout=120000)
+        page.wait_for_selector(".task-row", timeout=120000)
         time.sleep(1.2)
 
         # Chart rendered with marks
@@ -96,11 +96,11 @@ def main() -> int:
             if expected.upper() not in [a.upper() for a in axes]:
                 failures.append(f"missing status axis: {expected}")
 
-        # Keyboard: screen switching
-        page.keyboard.press("5")
+        # Keyboard: screen switching (6 = Evaluation in the six-view IA)
+        page.keyboard.press("6")
         time.sleep(0.6)
         if "Evaluation" not in page.locator(".nav button.active").text_content():
-            failures.append("keyboard screen switching (key 5) failed")
+            failures.append("keyboard screen switching (key 6) failed")
 
         page.screenshot(path=str(OUT / "02-forecast.png"))
         browser.close()

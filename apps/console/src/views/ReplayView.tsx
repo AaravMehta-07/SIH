@@ -1,12 +1,15 @@
-// Replay screen (K.2): prefix time separated from reveal controls; the
-// prediction process cannot retrieve future labels — only /reveal returns
-// them. After reveal: correct warnings, misses, false alerts and lead
-// times, scored without concealment.
+// Sealed replay (K.2, Section 7/30): the commitment theater. The decision
+// cutoff divides PAST OBSERVED from FUTURE LOCKED; the forecast is committed
+// with a hash before any reveal; only the evaluator-side /reveal endpoint
+// ever returns ground truth (SE02). After reveal: predicted vs actual with
+// advance warning and honest outcomes — matched, miss, false alert — scored
+// without concealment.
 
 import { useState } from "react";
 import type { ForecastPayload, RevealPayload, SessionSummary } from "../types";
 import { TASKS } from "../types";
-import { ErrorPanel, LoadingPanel, Tile, pct, taskColor } from "../components/charts";
+import { api } from "../api";
+import { ErrorPanel, LoadingPanel, pct, taskColor } from "../components/charts";
 
 export function ReplayView({
   session,
@@ -24,25 +27,13 @@ export function ReplayView({
   const [error, setError] = useState<string | null>(null);
 
   const cutoffs = session.valid_cutoffs;
-  const index = cutoffs.indexOf(cutoffWindow);
+  const index = Math.max(cutoffs.indexOf(cutoffWindow), 0);
 
   const doReveal = async () => {
     setRevealing(true);
     setError(null);
     try {
-      const response = await fetch(
-        `/v1/sessions/${session.session_id}/reveal`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cutoff_window: cutoffWindow }),
-        },
-      );
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body?.message ?? response.statusText);
-      }
-      setReveal((await response.json()) as RevealPayload);
+      setReveal(await api.reveal(session.session_id, cutoffWindow));
     } catch (e) {
       setError(String((e as Error).message ?? e));
     } finally {
@@ -54,12 +45,28 @@ export function ReplayView({
     e.tasks.filter((t) => t.alerting).map((t) => ({ entity: e.name, task: t })),
   );
 
-  const outcomeStyle = (outcome: string) =>
-    outcome === "correct_warning"
-      ? "good"
-      : outcome === "false_alert"
-        ? "critical"
-        : "warn";
+  const record = forecast?.record;
+  const comparison = reveal?.forecast_comparison ?? [];
+  const counts = {
+    matched: comparison.filter((c) => c.outcome === "correct_warning").length,
+    early: comparison.filter((c) => c.outcome === "early_warning_outside_horizon").length,
+    falseAlerts: comparison.filter((c) => c.outcome === "false_alert").length,
+    missed: (reveal?.events ?? []).filter(
+      (e) =>
+        e.relative_to_cutoff > 0 &&
+        !comparison.some(
+          (c) =>
+            c.entity === e.entity &&
+            c.task_index === e.task_index &&
+            c.outcome === "correct_warning",
+        ),
+    ).length,
+  };
+
+  const eventFor = (entity: string, taskIndex: number) =>
+    (reveal?.events ?? []).find(
+      (e) => e.entity === entity && e.task_index === taskIndex,
+    );
 
   return (
     <div className="fade-in">
@@ -67,208 +74,239 @@ export function ReplayView({
         <div>
           <h1>Sealed replay</h1>
           <p className="sub">
-            Advance the decision cutoff through the capture, forecast at each
-            point, then reveal the withheld ground truth. Time is virtual replay
-            time; the forecast endpoint never sees future labels (SE02).
+            Advance the decision cutoff, forecast, commit — then reveal the
+            withheld future. Time is virtual replay time; the forecast endpoint
+            never sees future labels (SE02). Outcomes are scored without
+            concealment.
           </p>
         </div>
-        <button className="btn primary" onClick={doReveal} disabled={revealing}>
-          {revealing ? "Revealing…" : "Reveal ground truth"}
-        </button>
       </div>
 
       {error && <ErrorPanel message={error} />}
-      {revealing && (
-        <div className="panel">
-          <LoadingPanel label="Evaluator-side reveal (separate authority)…" />
-        </div>
-      )}
 
-      <div className="panel" style={{ marginBottom: 14 }}>
-        <div className="scrubber">
+      <div className="theater" style={{ marginBottom: 16 }}>
+        <div className="scrubber" style={{ borderBottom: "1px solid var(--hairline)" }}>
           <input
             type="range"
             min={0}
             max={cutoffs.length - 1}
-            value={Math.max(index, 0)}
-            onChange={(e) => onCutoffChange(cutoffs[Number(e.target.value)])}
+            value={index}
+            onChange={(e) => {
+              setReveal(null);
+              onCutoffChange(cutoffs[Number(e.target.value)]);
+            }}
             aria-label="decision cutoff"
           />
           <div className="scrub-marks">
-            <span>window {cutoffs[0]} · {Math.round(cutoffs[0] * 0.5)}m</span>
+            <span>{Math.round(cutoffs[0] * 0.5)}m</span>
             <span style={{ color: "var(--ink-2)" }}>
               cutoff window {cutoffWindow} · {Math.round(cutoffWindow * 0.5)}m into capture
             </span>
-            <span>window {cutoffs[cutoffs.length - 1]} · {Math.round(cutoffs[cutoffs.length - 1] * 0.5)}m</span>
+            <span>{Math.round(cutoffs[cutoffs.length - 1] * 0.5)}m</span>
           </div>
         </div>
-      </div>
 
-      <div className="grid cols-2" style={{ marginBottom: 14 }}>
-        <div className="panel">
-          <div className="panel-head">
-            <h2>Forecast state at cutoff</h2>
-            <span className="hint">the prediction side</span>
+        {/* past | locked | committed */}
+        <div className="theater-strip">
+          <div className="t-side">
+            <span className="t-label" style={{ color: "var(--ink-2)" }}>Past · observed</span>
+            <span className="t-desc">
+              {forecast?.coverage.history_windows ?? 20} eligible windows ·
+              {" "}{forecast?.coverage.observed_hosts ?? "—"} hosts ·
+              {" "}{forecast?.flagged.length ?? 0} flagged signatures
+            </span>
           </div>
-          <div className="panel-body">
-            {alerting.length === 0 ? (
-              <div className="empty-state">
-                <span className="glyph">◦</span>
-                No alerts at this cutoff — the honest quiet state.
-              </div>
-            ) : (
-              <table className="data">
-                <thead>
-                  <tr>
-                    <th>Entity</th>
-                    <th>Target</th>
-                    <th className="num">5-min risk</th>
-                    <th className="num">Threshold</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {alerting.slice(0, 10).map((a, i) => (
-                    <tr key={i}>
-                      <td className="host-name">{a.entity}</td>
-                      <td style={{ color: taskColor(a.task.task_index) }}>{a.task.task_label}</td>
-                      <td className="num">{pct(a.task.cumulative_risk?.[9] ?? null)}</td>
-                      <td className="num muted">
-                        {a.task.policy_threshold != null ? pct(a.task.policy_threshold) : "—"}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+          <div className="t-lock">
+            <span className="lock-glyph" aria-hidden="true">⌛</span>
+            <span className="lock-text">Future locked</span>
+          </div>
+          <div className="t-side right">
+            <span className="t-label" style={{ color: "var(--accent)" }}>
+              Forecast {record?.committed ? "committed" : "pending"}
+            </span>
+            <span className="t-desc">
+              {record
+                ? `${(record.compute_to_ledger_seconds ?? 0).toFixed(2)}s compute → ledger`
+                : "run a forecast at this cutoff"}
+            </span>
+            {record && (
+              <span className="hash-chip" style={{ marginTop: 4 }}>
+                <span>{record.forecast_hash.slice(0, 18)}…</span>
+                <button
+                  onClick={() => navigator.clipboard?.writeText(record.forecast_hash)}
+                  aria-label="copy forecast hash"
+                >
+                  copy
+                </button>
+              </span>
             )}
           </div>
         </div>
 
-        {reveal && (
-          <div className="panel">
-            <div className="panel-head">
-              <h2>Reveal — ground truth</h2>
-              <span className="hint">evaluator side · {reveal.note}</span>
+        {/* reveal CTA or outcome board */}
+        {!reveal ? (
+          <div className="reveal-cta">
+            <button className="btn primary" onClick={doReveal} disabled={revealing || !record}>
+              {revealing ? "Revealing…" : "Reveal future"}
+            </button>
+            <span className="muted" style={{ fontSize: 11.5 }}>
+              evaluator-side authority · ground truth was never available to the forecast
+            </span>
+          </div>
+        ) : (
+          <div className="pva-board">
+            <div className="pva-cell">
+              <div className="pva-tag">Predicted · at cutoff {cutoffWindow}</div>
+              {alerting.length === 0 ? (
+                <div className="pva-main">No alerts at this cutoff</div>
+              ) : (
+                alerting.slice(0, 3).map((a, i) => (
+                  <div key={i} style={{ marginBottom: 8 }}>
+                    <div className="pva-main">
+                      <span style={{ color: taskColor(a.task.task_index) }}>
+                        {a.task.task_label}
+                      </span>{" "}
+                      · {a.entity.split(".")[0]}
+                    </div>
+                    <div className="pva-sub">
+                      5-min risk {pct(a.task.cumulative_risk?.[9] ?? null)}
+                      {a.task.eta ? ` · conditional ETA ~${Math.floor(a.task.eta.median_seconds / 60)}m` : ""}
+                    </div>
+                  </div>
+                ))
+              )}
+              {alerting.length > 3 && (
+                <div className="pva-sub">+{alerting.length - 3} more alerting targets</div>
+              )}
             </div>
-            <div className="panel-body flush table-wrap">
-              <table className="data">
-                <thead>
-                  <tr>
-                    <th>Entity</th>
-                    <th>Event</th>
-                    <th className="num">Window</th>
-                    <th className="num">vs cutoff</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {reveal.events.map((e, i) => (
-                    <tr key={i}>
-                      <td className="host-name">{e.entity}</td>
-                      <td style={{ color: taskColor(e.task_index) }}>
-                        {e.task_label}
-                        {e.label_tier === "weak_proxy" && (
-                          <span className="muted"> · proxy</span>
-                        )}
-                      </td>
-                      <td className="num mono">{e.event_window}</td>
-                      <td className="num">
-                        {e.relative_to_cutoff > 0
-                          ? `+${e.relative_to_cutoff}w`
-                          : `${e.relative_to_cutoff}w`}
-                      </td>
-                    </tr>
-                  ))}
-                  {reveal.events.length === 0 && (
-                    <tr>
-                      <td colSpan={4}>
-                        <div className="empty-state">
-                          No attack events in this capture (benign episode).
-                        </div>
-                      </td>
-                    </tr>
+            <div className="pva-cell">
+              <div className="pva-tag">Actual · revealed</div>
+              {comparison.length === 0 ? (
+                <div className="pva-sub" style={{ marginTop: 0 }}>
+                  {counts.matched + counts.falseAlerts === 0
+                    ? "No alerting targets to score at this cutoff."
+                    : ""}
+                </div>
+              ) : (
+                comparison.map((c, i) => {
+                  const event = eventFor(c.entity, c.task_index);
+                  return (
+                    <div
+                      key={i}
+                      style={{ marginBottom: 8, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}
+                    >
+                      <span
+                        className={`outcome-badge ${
+                          c.outcome === "correct_warning"
+                            ? "matched"
+                            : c.outcome === "false_alert"
+                              ? "false-alert"
+                              : "abstained"
+                        }`}
+                      >
+                        {c.outcome === "correct_warning"
+                          ? `Matched · +${Math.round((c.lead_seconds ?? 0) / 60)}m${Math.round(((c.lead_seconds ?? 0) % 60))}s warning`
+                          : c.outcome === "false_alert"
+                            ? "False alert"
+                            : "Early · outside horizon"}
+                      </span>
+                      <span className="pva-sub" style={{ marginTop: 0 }}>
+                        {TASKS[c.task_index]?.label ?? c.task_index} · {c.entity.split(".")[0]}
+                        {event ? ` · observed at +${Math.round(((event.event_window - cutoffWindow) * 30) / 60)}m` : ""}
+                      </span>
+                    </div>
+                  );
+                })
+              )}
+              {(counts.missed > 0 || (reveal.events.length === 0 && alerting.length === 0)) && (
+                <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                  {counts.missed > 0 && (
+                    <span className="outcome-badge miss">
+                      {counts.missed} missed event{counts.missed > 1 ? "s" : ""}
+                    </span>
                   )}
-                </tbody>
-              </table>
+                  {reveal.events.length === 0 && (
+                    <span className="pva-sub" style={{ marginTop: 0 }}>
+                      benign capture — no attack events
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         )}
       </div>
 
-      {reveal?.forecast_comparison && (
-        <>
-          <div className="section-label">Scored comparison — no concealment</div>
-          <div className="tiles" style={{ marginBottom: 12 }}>
-            <Tile
-              label="Correct warnings"
-              value={String(
-                reveal.forecast_comparison.filter((c) => c.outcome === "correct_warning").length,
-              )}
-              tone="good"
-            />
-            <Tile
-              label="Early (outside horizon)"
-              value={String(
-                reveal.forecast_comparison.filter((c) => c.outcome === "early_warning_outside_horizon").length,
-              )}
-              tone="warn"
-            />
-            <Tile
-              label="False alerts"
-              value={String(
-                reveal.forecast_comparison.filter((c) => c.outcome === "false_alert").length,
-              )}
-              tone="critical"
-            />
-            <Tile
-              label="Missed events"
-              value={String(
-                reveal.events.filter(
-                  (e) =>
-                    e.relative_to_cutoff > 0 &&
-                    !reveal.forecast_comparison?.some(
-                      (c) =>
-                        c.entity === e.entity &&
-                        c.task_index === e.task_index &&
-                        c.outcome === "correct_warning",
-                    ),
-                ).length,
-              )}
-              foot="events with no qualifying alert stay visible (EV01)"
-              tone="serious"
-            />
+      {/* summary strip */}
+      {reveal && (
+        <div className="v2-section">
+          <div className="v2-section-head">
+            <h3>Scored outcomes — no concealment</h3>
+            <span className="v2-hint">
+              {counts.matched} matched · {counts.early} early · {counts.falseAlerts} false · {counts.missed} missed
+            </span>
           </div>
-          <div className="panel">
-            <div className="panel-body flush table-wrap">
-              <table className="data">
-                <thead>
-                  <tr>
-                    <th>Entity</th>
-                    <th>Target</th>
-                    <th>Outcome</th>
-                    <th className="num">Lead time</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {reveal.forecast_comparison.map((c, i) => (
+          <div className="table-wrap">
+            <table className="data">
+              <thead>
+                <tr>
+                  <th>Entity</th>
+                  <th>Event</th>
+                  <th className="num">Event window</th>
+                  <th className="num">vs cutoff</th>
+                  <th className="num">Lead</th>
+                </tr>
+              </thead>
+              <tbody>
+                {reveal.events.map((e, i) => {
+                  const scored = comparison.find(
+                    (c) => c.entity === e.entity && c.task_index === e.task_index,
+                  );
+                  return (
                     <tr key={i}>
-                      <td className="host-name">{c.entity}</td>
-                      <td style={{ color: taskColor(c.task_index) }}>
-                        {TASKS[c.task_index]?.label ?? c.task_index}
+                      <td className="host-name">{e.entity}</td>
+                      <td style={{ color: taskColor(e.task_index) }}>
+                        {e.task_label}
+                        {e.label_tier === "weak_proxy" && <span className="muted"> · proxy</span>}
                       </td>
-                      <td>
-                        <span className={`tag ${outcomeStyle(c.outcome) === "good" ? "benign" : "attack"}`}>
-                          {c.outcome.replace(/_/g, " ")}
-                        </span>
+                      <td className="num mono">{e.event_window}</td>
+                      <td className="num">
+                        {e.relative_to_cutoff > 0
+                          ? `+${Math.round((e.relative_to_cutoff * 30) / 60)}m`
+                          : `${Math.round((e.relative_to_cutoff * 30) / 60)}m`}
                       </td>
                       <td className="num">
-                        {c.lead_seconds != null ? `${c.lead_seconds}s` : "—"}
+                        {scored?.lead_seconds != null
+                          ? `${Math.floor(scored.lead_seconds / 60)}:${String(scored.lead_seconds % 60).padStart(2, "0")}`
+                          : scored
+                            ? "—"
+                            : e.relative_to_cutoff > 0
+                              ? "missed"
+                              : "before cutoff"}
                       </td>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  );
+                })}
+                {reveal.events.length === 0 && (
+                  <tr>
+                    <td colSpan={5}>
+                      <div className="empty-state">
+                        No attack events in this capture (benign episode) — a quiet
+                        forecast is the honest outcome.
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
           </div>
-        </>
+        </div>
+      )}
+
+      {revealing && (
+        <div className="panel">
+          <LoadingPanel label="Evaluator-side reveal (separate authority)…" />
+        </div>
       )}
     </div>
   );
